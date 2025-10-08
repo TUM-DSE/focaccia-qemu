@@ -1,4 +1,8 @@
+#include <stdio.h>
+
 #include <qemu-plugin.h>
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 static void plugin_init(void) {
 }
