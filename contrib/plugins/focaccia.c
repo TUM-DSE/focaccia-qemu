@@ -58,6 +58,7 @@ qemu_plugin_u64 Offset;
 qemu_plugin_u64 Len;
 
 GHashTable *reg_map;
+static char const *pc_reg;
 
 #define SOCK_PATH "/tmp/focaccia.sock"
 
@@ -82,6 +83,14 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index)
     for (int r = 0; r < reg_list->len; r++) {
         qemu_plugin_reg_descriptor *rd = &g_array_index(reg_list, qemu_plugin_reg_descriptor, r);
         g_hash_table_insert(reg_map, g_strdup(rd->name), GINT_TO_POINTER(r+1)); // g_hash_table cannot deal with NULL values
+        printf("Reg: %s\n", rd->name);
+    }
+
+    qemu_plugin_reg_descriptor *rd = &g_array_index(reg_list, qemu_plugin_reg_descriptor, 0);
+    if (strstr(rd->feature, "aarch64") != NULL) {
+        pc_reg = "pc";
+    } else {
+        pc_reg = "rip";
     }
 
     // Register with focaccia over a socket
@@ -139,9 +148,9 @@ static void read_register(unsigned int cpu_index, Command cmd) {
     }
 
     Register reg;
-    if (strncmp(cmd.data._reg.reg_name, "rip", 4) == 0) {
+    if (strncmp(cmd.data._reg.reg_name, pc_reg, 3) == 0) {
         unsigned long long rip = qemu_plugin_u64_get(Virt, cpu_index);
-        strncpy(reg.name, "rip", sizeof(reg.name) - 1);
+        strncpy(reg.name, pc_reg, sizeof(reg.name) - 1);
         reg.nr_bytes = sizeof(rip);
         memcpy(reg.value, &rip, sizeof(rip));
     } else {
@@ -217,7 +226,7 @@ static void execute_step(unsigned int cpu_index, void *udata) {
     // Reset PC and Offset if it does not match $rip
     g_autoptr(GArray) reg_list = qemu_plugin_get_registers();
 
-    gpointer map_val = g_hash_table_lookup(reg_map, "rip");
+    gpointer map_val = g_hash_table_lookup(reg_map, pc_reg);
 
     if (map_val == NULL) {
         printf("RIP not cached\n");
