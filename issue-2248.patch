@@ -1,0 +1,18 @@
+diff --git a/tcg/optimize.c b/tcg/optimize.c
+index f922f86a1d..a864331b69 100644
+--- a/tcg/optimize.c
++++ b/tcg/optimize.c
+@@ -2618,8 +2618,11 @@ static bool fold_shift(OptContext *ctx, TCGOp *op)
+          * If the sign bit is known zero, then logical right shift
+          * will not reduce the number of input sign repetitions.
+          */
+-        if (~z_mask & -s_mask) {
+-            return fold_masks_s(ctx, op, s_mask);
++        {
++            uint64_t sign = (s_mask & -s_mask) >> 1;
++            if (!(z_mask & sign)) {
++                return fold_masks_s(ctx, op, s_mask);
++            }
+         }
+         break;
+     default:
