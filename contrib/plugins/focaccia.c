@@ -1,331 +1,489 @@
+#include <errno.h>
 #include <glib.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
-
+#include <unistd.h>
 
 #include <qemu-plugin.h>
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-typedef struct {
-    unsigned long long pc;
-    unsigned long long virt;
-    unsigned long long offset;
-    unsigned long long length;
-} pcTracker;
+#define DEFAULT_SOCKET_PATH "/tmp/focaccia.sock"
+#define PROTOCOL_VERSION 2u
+#define PROTOCOL_FAILURE_STATUS 125
+#define HANDSHAKE_SIZE 40u
+#define COMMAND_SIZE 32u
+#define REGISTER_RESPONSE_SIZE 104u
+#define MEMORY_RESPONSE_SIZE 24u
+#define ACK_SIZE 8u
+#define MAX_REGISTER_BYTES 64u
+#define REGISTER_NAME_SIZE 32u
 
-enum Granularity {
-    UNDEF = -1,
-    BASIC_BLOCK,
-    INSTRUCTION
+#define COMMAND_READ_REGISTER 1u
+#define COMMAND_READ_MEMORY 2u
+#define COMMAND_STEP 3u
+#define COMMAND_FINISH 4u
+#define COMMAND_ABORT 5u
+
+#define RESPONSE_OK 0u
+#define RESPONSE_UNAVAILABLE 1u
+
+#define TARGET_LITTLE_ENDIAN 1u
+#define TARGET_BIG_ENDIAN 2u
+
+static const uint8_t protocol_magic[8] = {
+    'F', 'O', 'C', 'P', 'L', 'U', 'G', 0,
+};
+static const uint8_t handshake_ack[ACK_SIZE] = {
+    'F', 'O', 'C', 'A', 'C', 'P', 'T', '2',
+};
+static const uint8_t finish_ack[ACK_SIZE] = {
+    'F', 'O', 'C', 'F', 'I', 'N', '0', '2',
+};
+static const uint8_t abort_ack[ACK_SIZE] = {
+    'F', 'O', 'C', 'A', 'B', 'R', '0', '2',
 };
 
-typedef struct __attribute__((packed)) Command {
-    union {
-        struct {
-            long long addr;
-            long long val;
-        } _mem;
-        struct {
-            char reg_name[16];
-        } _reg;
-        struct {
-            char unused[16];
-        } _step;
-    } data;
-    char cmd[9];
-} Command;
+typedef struct {
+    uint64_t instruction_address;
+} FocacciaScoreboard;
 
-typedef struct __attribute__((packed)) Register {
-    char name[108];
-    unsigned long nr_bytes;
-    char value[64];
-} Register;
+static int socket_fd = -1;
+static char *socket_path;
+static char target_name[16];
+static const char *pc_register;
+static uint8_t target_endianness;
+static uint8_t plugin_api_min;
+static uint8_t plugin_api_current;
+static uint64_t start_address;
+static uint64_t stop_address = UINT64_MAX;
+static bool initialized;
+static bool finished;
 
-typedef struct __attribute__((packed)) Memory {
-    unsigned long long addr;
-    unsigned long nr_bytes;
-} Memory;
+static GHashTable *registers;
+static struct qemu_plugin_scoreboard *scoreboard;
+static qemu_plugin_u64 instruction_address;
 
-static int sock_fd = -1;
-
-struct qemu_plugin_scoreboard *state;
-qemu_plugin_u64 pc;
-qemu_plugin_u64 virt;
-qemu_plugin_u64 Offset;
-qemu_plugin_u64 Len;
-
-GHashTable *reg_map;
-static char const *pc_reg;
-
-#define SOCK_PATH "/tmp/focaccia.sock"
-
-static void plugin_init(void) {
-    state = qemu_plugin_scoreboard_new(sizeof(pcTracker));
-    pc = qemu_plugin_scoreboard_u64_in_struct(state, pcTracker, pc);
-    virt = qemu_plugin_scoreboard_u64_in_struct(state, pcTracker, virt);
-    Offset = qemu_plugin_scoreboard_u64_in_struct(state, pcTracker, offset);
-    Len = qemu_plugin_scoreboard_u64_in_struct(state, pcTracker, length);
-
-    reg_map = g_hash_table_new(g_str_hash, g_str_equal);
-}
-
-static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index)
+static void put_u32_le(uint8_t *destination, uint32_t value)
 {
-    // New execution
-    // Save register indexes
-
-    g_autoptr(GArray) reg_list = qemu_plugin_get_registers();
-    for (int r = 0; r < reg_list->len; r++) {
-        qemu_plugin_reg_descriptor *rd = &g_array_index(reg_list, qemu_plugin_reg_descriptor, r);
-        g_hash_table_insert(reg_map, g_strdup(rd->name), GINT_TO_POINTER(r+1)); // g_hash_table cannot deal with NULL values
-        printf("Reg: %s\n", rd->name);
+    for (size_t index = 0; index < 4; index++) {
+        destination[index] = (uint8_t)(value >> (index * 8));
     }
+}
 
-    qemu_plugin_reg_descriptor *rd = &g_array_index(reg_list, qemu_plugin_reg_descriptor, 0);
-    if (strstr(rd->feature, "aarch64") != NULL) {
-        pc_reg = "pc";
+static void put_u64_le(uint8_t *destination, uint64_t value)
+{
+    for (size_t index = 0; index < 8; index++) {
+        destination[index] = (uint8_t)(value >> (index * 8));
+    }
+}
+
+static uint64_t get_u64_le(const uint8_t *source)
+{
+    uint64_t value = 0;
+    for (size_t index = 0; index < 8; index++) {
+        value |= (uint64_t)source[index] << (index * 8);
+    }
+    return value;
+}
+
+static void put_target_u64(uint8_t *destination, uint64_t value)
+{
+    if (target_endianness == TARGET_BIG_ENDIAN) {
+        for (size_t index = 0; index < 8; index++) {
+            destination[7 - index] = (uint8_t)(value >> (index * 8));
+        }
     } else {
-        pc_reg = "rip";
-    }
-
-    // Register with focaccia over a socket
-
-    // Connect to socket and send initial handshake
-    sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock_fd == -1) {
-        perror("socket");
-        exit(-1);
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
-    if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-        perror("connect");
-        close(sock_fd);
-        exit(-1);
-    }
-
-    // Send ping
-    const pid_t pid = getpid();
-    ssize_t r = write(sock_fd, &pid, sizeof(int));
-    if (r != sizeof(int)) {
-        fprintf(stderr, "Error writing PID to socket\n");
+        put_u64_le(destination, value);
     }
 }
 
-static void plugin_exit(qemu_plugin_id_t id, void* p) {
-    if (sock_fd != -1) {
-        close(sock_fd);
-    }
-    printf("Plugin has completed!\n");
-}
+static bool read_full(int fd, void *buffer, size_t size)
+{
+    uint8_t *bytes = buffer;
+    size_t received = 0;
 
-static void read_register(unsigned int cpu_index, Command cmd) {
-    // printf("Read register command received for register: %s\n", cmd.data._reg.reg_name);
-    // Get all exposed registers
-    g_autoptr(GArray) reg_list = qemu_plugin_get_registers();
-
-    gpointer map_val = g_hash_table_lookup(reg_map, cmd.data._reg.reg_name);
-
-    if (map_val == NULL) {
-        printf("Register %s unknown to QEMU\n", cmd.data._reg.reg_name);
-        Register fail;
-        memset(&fail, 0, sizeof(Register));
-        strncpy(fail.name, "UNKNOWN", sizeof(fail.name) - 1);
-        int ret = write(sock_fd, &fail, sizeof(Register));
-        if (ret != sizeof(Register)) {
-            fprintf(stderr, "Error writing unknown response\n");
+    while (received < size) {
+        ssize_t result = recv(fd, bytes + received, size - received, 0);
+        if (result > 0) {
+            received += (size_t)result;
+            continue;
         }
-
-        return;
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
     }
+    return true;
+}
 
-    Register reg;
-    if (strncmp(cmd.data._reg.reg_name, pc_reg, 3) == 0) {
-        unsigned long long rip = qemu_plugin_u64_get(virt, cpu_index);
-        strncpy(reg.name, pc_reg, sizeof(reg.name) - 1);
-        reg.nr_bytes = sizeof(rip);
-        memcpy(reg.value, &rip, sizeof(rip));
+static bool write_full(int fd, const void *buffer, size_t size)
+{
+    const uint8_t *bytes = buffer;
+    size_t written = 0;
+
+    while (written < size) {
+        ssize_t result = send(fd, bytes + written, size - written, MSG_NOSIGNAL);
+        if (result > 0) {
+            written += (size_t)result;
+            continue;
+        }
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static G_NORETURN void protocol_failure(const char *message)
+{
+    fprintf(stderr, "Focaccia plugin protocol failure: %s\n", message);
+    if (socket_fd != -1) {
+        close(socket_fd);
+        socket_fd = -1;
+    }
+    _exit(PROTOCOL_FAILURE_STATUS);
+}
+
+static bool parse_address(const char *text, uint64_t *result)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = g_ascii_strtoull(text, &end, 0);
+    if (errno != 0 || end == text || *end != '\0') {
+        return false;
+    }
+    *result = (uint64_t)value;
+    return true;
+}
+
+static bool select_target(const qemu_info_t *info)
+{
+    size_t length = strlen(info->target_name);
+    if (length == 0 || length >= sizeof(target_name)) {
+        return false;
+    }
+    memcpy(target_name, info->target_name, length + 1);
+
+    if (strcmp(target_name, "aarch64") == 0) {
+        pc_register = "pc";
+        target_endianness = TARGET_LITTLE_ENDIAN;
+    } else if (strcmp(target_name, "aarch64_be") == 0) {
+        pc_register = "pc";
+        target_endianness = TARGET_BIG_ENDIAN;
+    } else if (strcmp(target_name, "x86_64") == 0) {
+        pc_register = "rip";
+        target_endianness = TARGET_LITTLE_ENDIAN;
     } else {
-
-
-        int idx = GPOINTER_TO_INT(map_val)-1;
-        qemu_plugin_reg_descriptor *rd = &g_array_index(reg_list, qemu_plugin_reg_descriptor, idx);
-
-        GByteArray *buf = g_byte_array_new();
-        int sz = qemu_plugin_read_register(rd->handle, buf);
-
-        if (sz <= 0) {
-            fprintf(stderr, "Error reading register %s\n", rd->name);
-            g_byte_array_free(buf, TRUE);
-            exit(-1);
-        }
-
-        strncpy(reg.name, rd->name, sizeof(reg.name) - 1);
-        reg.nr_bytes = sz;
-        memcpy(reg.value, buf->data, sz);
+        return false;
     }
 
-    // Send pc value over socket
-    int ret = write(sock_fd, &reg, sizeof(Register));
-    if (ret != sizeof(Register)) {
-        fprintf(stderr, "Error writing register %s to socket\n", cmd.data._reg.reg_name);
+    if (info->version.min < 0 || info->version.min > UINT8_MAX ||
+        info->version.cur < 0 || info->version.cur > UINT8_MAX) {
+        return false;
     }
+    plugin_api_min = (uint8_t)info->version.min;
+    plugin_api_current = (uint8_t)info->version.cur;
+    return true;
 }
 
-static void read_memory(Command cmd) {
-
-    GByteArray *data = g_byte_array_new();
-    if (!qemu_plugin_read_memory_vaddr(cmd.data._mem.addr, data, cmd.data._mem.val)) {
-        fprintf(stderr, "Error reading memory at address 0x%llx\n", cmd.data._mem.addr);
-        g_byte_array_free(data, TRUE);
-
-        Memory fail = {0, 0};
-        int ret = write(sock_fd, &fail, sizeof(fail));
-        if (ret != sizeof(fail)) {
-            fprintf(stderr, "Error writing failing response\n");
-        }
-
-        return;
-    }
-
-    if (data->len != cmd.data._mem.val)
-        fprintf(stderr, "Read memory size mismatch at address 0x%llx\n", cmd.data._mem.addr);
-
-    Memory mem;
-    mem.addr = cmd.data._mem.addr;
-    mem.nr_bytes = data->len;
-
-    int ret = write(sock_fd, &mem, sizeof(Memory));
-    if (ret != sizeof(Memory)) {
-        fprintf(stderr, "Error writing memory header to socket\n");
-    }
-
-    int written = 0;
-    while (written < data->len) {
-        int _ret = write(sock_fd, data->data + written, data->len - written);
-        if (_ret == -1) {
-            fprintf(stderr, "Error sending memory content\n");
-        }
-        written += _ret;
-    }
-}
-
-static void execute_step(unsigned int cpu_index, void *udata) {
-
-    // Conceptually we can now read the state *before* the instruction executes
-    Command cmd;
-
-    // Reset pc and Offset if it does not match $rip
-    g_autoptr(GArray) reg_list = qemu_plugin_get_registers();
-
-    gpointer map_val = g_hash_table_lookup(reg_map, pc_reg);
-
-    if (map_val == NULL) {
-        printf("RIP not cached\n");
-        Register fail;
-        memset(&fail, 0, sizeof(Register));
-        strncpy(fail.name, "UNKNOWN", sizeof(fail.name) - 1);
-        int ret = write(sock_fd, &fail, sizeof(Register));
-        if (ret != sizeof(Register)) {
-            fprintf(stderr, "Error writing unknown response\n");
-        }
-
-        exit(-1);
-    }
-
-    int idx = GPOINTER_TO_INT(map_val)-1;
-    qemu_plugin_reg_descriptor *rd = &g_array_index(reg_list, qemu_plugin_reg_descriptor, idx);
-
-    GByteArray *buf = g_byte_array_new();
-    int sz = qemu_plugin_read_register(rd->handle, buf);
-    if (sz <= 0) {
-        fprintf(stderr, "Error reading register %s\n", rd->name);
-        g_byte_array_free(buf, TRUE);
-        exit(-1);
-    }
-    unsigned long long rip = 0;
-    memcpy(&rip, buf->data, sz);
-    if (qemu_plugin_u64_get(pc, cpu_index) != rip) {
-        qemu_plugin_u64_set(pc, cpu_index, rip);
-        qemu_plugin_u64_set(Offset, cpu_index, 0);
-    }
-
-    while (1) {
-        // assume we read 23bytes at once
-        ssize_t n = read(sock_fd, &cmd, sizeof(Command));
-        if (n < 0) {
-            perror("Error reading from socket\n");
-            exit(-1);
-        }
-        if (n == 0) {
-            printf("Facaccia server disconnected\n");
-            exit(0);
-        }
-        if (n != sizeof(Command)) {
-            printf("Only recieved partial command\n");
-            exit(-1);
-        }
-
-        if (strncmp(cmd.cmd, "STEP ONE", 9) == 0) {
-            qemu_plugin_u64_add(Offset, cpu_index, qemu_plugin_u64_get(Len, cpu_index));
-            return; // proceed with execution
-        } else if (strncmp(cmd.cmd, "READ REG", 9) == 0) {
-            // Read register command
-            read_register(cpu_index, cmd);
-        } else if (strncmp(cmd.cmd, "READ MEM", 9) == 0) {
-            // Write register command
-            read_memory(cmd);
+static bool parse_options(int argc, char **argv)
+{
+    socket_path = g_strdup(DEFAULT_SOCKET_PATH);
+    for (int index = 0; index < argc; index++) {
+        const char *option = argv[index];
+        if (g_str_has_prefix(option, "socket=")) {
+            const char *value = option + strlen("socket=");
+            if (*value == '\0') {
+                return false;
+            }
+            g_free(socket_path);
+            socket_path = g_strdup(value);
+        } else if (g_str_has_prefix(option, "start=")) {
+            if (!parse_address(option + strlen("start="), &start_address)) {
+                return false;
+            }
+        } else if (g_str_has_prefix(option, "stop=")) {
+            if (!parse_address(option + strlen("stop="), &stop_address)) {
+                return false;
+            }
         } else {
-            printf("Unknown command received: %s\n", cmd.cmd);
-            exit(-1);
+            fprintf(stderr, "Unknown Focaccia plugin option: %s\n", option);
+            return false;
         }
     }
 
+    if (start_address > stop_address ||
+        strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        return false;
+    }
+    return true;
 }
 
-static void register_tracer(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+static void connect_to_validator(void)
+{
+    struct sockaddr_un address;
+    uint8_t handshake[HANDSHAKE_SIZE] = {0};
+    uint8_t acknowledgement[ACK_SIZE];
 
-    struct qemu_plugin_insn *insn;
-    size_t n_insns = qemu_plugin_tb_n_insns(tb);
+    socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd == -1) {
+        protocol_failure("unable to create Unix socket");
+    }
 
-    // TODO: If granularity is BASIC_BLOCK, only register the first
-    for (size_t i = 0; i < n_insns; i++) {
-        insn = qemu_plugin_tb_get_insn(tb, i);
-        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(insn,
-                                                            QEMU_PLUGIN_INLINE_STORE_U64,
-                                                            virt, qemu_plugin_insn_vaddr(insn));
-        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(insn,
-                                                            QEMU_PLUGIN_INLINE_STORE_U64,
-                                                            Len,
-                                                            qemu_plugin_insn_size(insn));
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1);
+    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        protocol_failure("unable to connect to validator socket");
+    }
 
-        qemu_plugin_register_vcpu_insn_exec_cb(insn, execute_step, QEMU_PLUGIN_CB_R_REGS, NULL);
+    memcpy(handshake, protocol_magic, sizeof(protocol_magic));
+    put_u32_le(handshake + 8, PROTOCOL_VERSION);
+    put_u32_le(handshake + 12, (uint32_t)getpid());
+    memcpy(handshake + 16, target_name, strlen(target_name));
+    handshake[32] = target_endianness;
+    handshake[33] = 64;
+    handshake[34] = plugin_api_min;
+    handshake[35] = plugin_api_current;
+
+    if (!write_full(socket_fd, handshake, sizeof(handshake)) ||
+        !read_full(socket_fd, acknowledgement, sizeof(acknowledgement)) ||
+        memcmp(acknowledgement, handshake_ack, sizeof(handshake_ack)) != 0) {
+        protocol_failure("protocol negotiation failed");
     }
 }
 
-// argc and argv correspond to the arguments passed via -plugin focaccia.so,arg1=<arg1>,arg2=<arg2>
+static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
+{
+    (void)id;
+    if (initialized || vcpu_index != 0) {
+        protocol_failure("only one vCPU is supported");
+    }
+    initialized = true;
+
+    g_autoptr(GArray) register_list = qemu_plugin_get_registers();
+    for (guint index = 0; index < register_list->len; index++) {
+        qemu_plugin_reg_descriptor *descriptor =
+            &g_array_index(register_list, qemu_plugin_reg_descriptor, index);
+        if (descriptor->name == NULL || descriptor->handle == NULL ||
+            strlen(descriptor->name) >= REGISTER_NAME_SIZE) {
+            continue;
+        }
+        g_hash_table_insert(registers, g_strdup(descriptor->name), descriptor->handle);
+    }
+
+    if (g_hash_table_lookup(registers, pc_register) == NULL) {
+        protocol_failure("program counter register is unavailable");
+    }
+    connect_to_validator();
+}
+
+static void send_register(unsigned int cpu_index, const uint8_t *command)
+{
+    uint8_t response[REGISTER_RESPONSE_SIZE] = {0};
+    char requested[17] = {0};
+    memcpy(requested, command + 8, 16);
+    if (memchr(requested, '\0', sizeof(requested) - 1) == NULL || requested[0] == '\0') {
+        protocol_failure("malformed register name");
+    }
+
+    if (strcmp(requested, pc_register) == 0) {
+        response[0] = RESPONSE_OK;
+        response[1] = 8;
+        memcpy(response + 8, pc_register, strlen(pc_register));
+        put_target_u64(
+            response + 40,
+            qemu_plugin_u64_get(instruction_address, cpu_index)
+        );
+    } else {
+        struct qemu_plugin_register *handle = g_hash_table_lookup(registers, requested);
+        if (handle == NULL) {
+            response[0] = RESPONSE_UNAVAILABLE;
+            memcpy(response + 8, requested, strlen(requested));
+        } else {
+            g_autoptr(GByteArray) value = g_byte_array_new();
+            int size = qemu_plugin_read_register(handle, value);
+            if (size <= 0 || (unsigned int)size > MAX_REGISTER_BYTES ||
+                value->len != (guint)size) {
+                response[0] = RESPONSE_UNAVAILABLE;
+                memcpy(response + 8, requested, strlen(requested));
+            } else {
+                response[0] = RESPONSE_OK;
+                response[1] = (uint8_t)size;
+                memcpy(response + 8, requested, strlen(requested));
+                memcpy(response + 40, value->data, (size_t)size);
+            }
+        }
+    }
+
+    if (!write_full(socket_fd, response, sizeof(response))) {
+        protocol_failure("unable to send register response");
+    }
+}
+
+static void send_memory(const uint8_t *command)
+{
+    uint64_t address = get_u64_le(command + 8);
+    uint64_t size = get_u64_le(command + 16);
+    uint8_t response[MEMORY_RESPONSE_SIZE] = {0};
+
+    put_u64_le(response + 8, address);
+    if (size == 0 || size > G_MAXSIZE) {
+        response[0] = RESPONSE_UNAVAILABLE;
+    } else {
+        g_autoptr(GByteArray) data = g_byte_array_new();
+        if (!qemu_plugin_read_memory_vaddr(address, data, (size_t)size) ||
+            data->len != size) {
+            response[0] = RESPONSE_UNAVAILABLE;
+        } else {
+            response[0] = RESPONSE_OK;
+            put_u64_le(response + 16, size);
+            if (!write_full(socket_fd, response, sizeof(response)) ||
+                !write_full(socket_fd, data->data, data->len)) {
+                protocol_failure("unable to send memory response");
+            }
+            return;
+        }
+    }
+
+    if (!write_full(socket_fd, response, sizeof(response))) {
+        protocol_failure("unable to send unavailable-memory response");
+    }
+}
+
+static bool reserved_command_bytes_are_zero(const uint8_t *command)
+{
+    for (size_t index = 1; index < 8; index++) {
+        if (command[index] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void execute_instruction(unsigned int cpu_index, void *userdata)
+{
+    uint8_t command[COMMAND_SIZE];
+    (void)userdata;
+
+    if (finished) {
+        return;
+    }
+
+    while (true) {
+        if (!read_full(socket_fd, command, sizeof(command))) {
+            protocol_failure("validator disconnected during an instruction callback");
+        }
+        if (!reserved_command_bytes_are_zero(command)) {
+            protocol_failure("command reserved bytes are nonzero");
+        }
+
+        switch (command[0]) {
+        case COMMAND_READ_REGISTER:
+            send_register(cpu_index, command);
+            break;
+        case COMMAND_READ_MEMORY:
+            send_memory(command);
+            break;
+        case COMMAND_STEP:
+            return;
+        case COMMAND_FINISH:
+            if (!write_full(socket_fd, finish_ack, sizeof(finish_ack))) {
+                protocol_failure("unable to acknowledge finish command");
+            }
+            finished = true;
+            close(socket_fd);
+            socket_fd = -1;
+            return;
+        case COMMAND_ABORT:
+            write_full(socket_fd, abort_ack, sizeof(abort_ack));
+            close(socket_fd);
+            socket_fd = -1;
+            _exit(PROTOCOL_FAILURE_STATUS);
+        default:
+            protocol_failure("unknown command opcode");
+        }
+    }
+}
+
+static void instrument_translation_block(
+    qemu_plugin_id_t id,
+    struct qemu_plugin_tb *translation_block
+)
+{
+    (void)id;
+    size_t instruction_count = qemu_plugin_tb_n_insns(translation_block);
+    for (size_t index = 0; index < instruction_count; index++) {
+        struct qemu_plugin_insn *instruction =
+            qemu_plugin_tb_get_insn(translation_block, index);
+        uint64_t address = qemu_plugin_insn_vaddr(instruction);
+        if (address < start_address || address > stop_address) {
+            continue;
+        }
+        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+            instruction,
+            QEMU_PLUGIN_INLINE_STORE_U64,
+            instruction_address,
+            address
+        );
+        qemu_plugin_register_vcpu_insn_exec_cb(
+            instruction,
+            execute_instruction,
+            QEMU_PLUGIN_CB_R_REGS,
+            NULL
+        );
+    }
+}
+
+static void plugin_exit(qemu_plugin_id_t id, void *userdata)
+{
+    (void)id;
+    (void)userdata;
+    if (socket_fd != -1) {
+        close(socket_fd);
+        socket_fd = -1;
+    }
+    if (registers != NULL) {
+        g_hash_table_destroy(registers);
+        registers = NULL;
+    }
+    if (scoreboard != NULL) {
+        qemu_plugin_scoreboard_free(scoreboard);
+        scoreboard = NULL;
+    }
+    g_clear_pointer(&socket_path, g_free);
+}
+
 QEMU_PLUGIN_EXPORT
-int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc, char **argv) {
-    int i;
-
-    // Process plugin arguments
-    printf("Received plugin options:\n");
-    for (i = 0; i < argc; i++) {
-        printf("%s\n", argv[i]);
+int qemu_plugin_install(
+    qemu_plugin_id_t id,
+    const qemu_info_t *info,
+    int argc,
+    char **argv
+)
+{
+    if (info->system_emulation || !select_target(info) || !parse_options(argc, argv)) {
+        fprintf(stderr, "Unsupported Focaccia plugin target or options\n");
+        return -1;
     }
 
-    plugin_init();
+    registers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    scoreboard = qemu_plugin_scoreboard_new(sizeof(FocacciaScoreboard));
+    instruction_address = qemu_plugin_scoreboard_u64_in_struct(
+        scoreboard,
+        FocacciaScoreboard,
+        instruction_address
+    );
 
-    qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
-    qemu_plugin_register_vcpu_tb_trans_cb(id, register_tracer);
+    qemu_plugin_register_vcpu_init_cb(id, initialize_vcpu);
+    qemu_plugin_register_vcpu_tb_trans_cb(id, instrument_translation_block);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     return 0;
 }
-
