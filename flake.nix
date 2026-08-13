@@ -88,6 +88,11 @@
         # Dedicated regression-injected package used only by the #2248 case.
         with-focaccia-plugin-2248 = injectedQemu;
 
+        plugin-source = pkgs.runCommand "focaccia-qemu-plugin-source" { } ''
+          mkdir -p "$out/contrib/plugins"
+          cp ${./contrib/plugins/focaccia.c} "$out/contrib/plugins/focaccia.c"
+        '';
+
         default = referenceQemu;
       };
 
