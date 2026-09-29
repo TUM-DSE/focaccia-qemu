@@ -62,6 +62,7 @@ static uint8_t plugin_api_min;
 static uint8_t plugin_api_current;
 static uint64_t start_address;
 static uint64_t stop_address = UINT64_MAX;
+static bool coarse_cutpoints;
 static bool initialized;
 static bool finished;
 
@@ -213,6 +214,8 @@ static bool parse_options(int argc, char **argv)
             if (!parse_address(option + strlen("stop="), &stop_address)) {
                 return false;
             }
+        } else if (strcmp(option, "coarse=on") == 0) {
+            coarse_cutpoints = true;
         } else {
             fprintf(stderr, "Unknown Focaccia plugin option: %s\n", option);
             return false;
@@ -424,7 +427,8 @@ static void instrument_translation_block(
         struct qemu_plugin_insn *instruction =
             qemu_plugin_tb_get_insn(translation_block, index);
         uint64_t address = qemu_plugin_insn_vaddr(instruction);
-        if (address < start_address || address > stop_address) {
+        if (address < start_address || address > stop_address ||
+            (coarse_cutpoints && address != start_address && address != stop_address)) {
             continue;
         }
         qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
