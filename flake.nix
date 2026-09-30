@@ -36,7 +36,7 @@
         pluginsSupport = true;
       };
 
-      mk-focaccia-qemu = { pname, regressionPatch ? null }:
+      mk-focaccia-qemu = { pname, regressionPatch ? null, regressionIssue ? null }:
         qemu-with-focaccia-plugin.overrideAttrs (old: {
           inherit pname;
           version = "9.2.92";
@@ -70,7 +70,7 @@
 
           passthru = (old.passthru or {}) // {
             focacciaPluginLockstep = true;
-            issue2248Injected = regressionPatch != null;
+            focacciaRegressionIssue = regressionIssue;
           };
         });
       referenceQemu = mk-focaccia-qemu {
@@ -79,14 +79,27 @@
       injectedQemu = mk-focaccia-qemu {
         pname = "qemu-focaccia-2248-injected";
         regressionPatch = ./issue-2248.patch;
+        regressionIssue = 2248;
+      };
+      injectedQemu364 = mk-focaccia-qemu {
+        pname = "qemu-focaccia-364-injected";
+        regressionPatch = ./issue-364.patch;
+        regressionIssue = 364;
+      };
+      injectedQemu2419 = mk-focaccia-qemu {
+        pname = "qemu-focaccia-2419-injected";
+        regressionPatch = ./issue-2419.patch;
+        regressionIssue = 2419;
       };
     in {
       packages = {
         # Preserve the existing package as the fixed/reference optimizer build.
         with-focaccia-plugin = referenceQemu;
 
-        # Dedicated regression-injected package used only by the #2248 case.
+        # Dedicated regression-injected packages used only by their named cases.
         with-focaccia-plugin-2248 = injectedQemu;
+        with-focaccia-plugin-364 = injectedQemu364;
+        with-focaccia-plugin-2419 = injectedQemu2419;
 
         plugin-source = pkgs.runCommand "focaccia-qemu-plugin-source" { } ''
           mkdir -p "$out/contrib/plugins"
