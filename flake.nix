@@ -69,7 +69,7 @@
           hardeningDisable = [ "all" ];
 
           passthru = (old.passthru or {}) // {
-            focacciaPluginProtocol = 2;
+            focacciaPluginLockstep = true;
             issue2248Injected = regressionPatch != null;
           };
         });

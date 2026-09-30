@@ -41,6 +41,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define EVENT_STORE 2u
 #define EVENT_AARCH64_SVC_ENTRY 3u
 #define EVENT_AARCH64_SVC_SUCCESSOR 4u
+#define EVENT_TRANSLATION_BLOCK 5u
 #define EVENT_SIZE 96u
 
 #define RESPONSE_OK 0u
@@ -67,6 +68,7 @@ typedef struct {
 } FocacciaScoreboard;
 
 typedef struct {
+    uint64_t pc;
     uint64_t address;
     uint64_t size;
     uint8_t value[16];
@@ -78,6 +80,12 @@ typedef struct {
     bool svc;
 } InstructionMetadata;
 
+typedef struct {
+    uint64_t first_pc;
+    uint64_t last_pc;
+    uint64_t instruction_count;
+} TranslationBlockMetadata;
+
 static int socket_fd = -1;
 static char *socket_path;
 static char target_name[16];
@@ -88,6 +96,7 @@ static uint8_t plugin_api_current;
 static uint64_t start_address;
 static uint64_t stop_address = UINT64_MAX;
 static bool coarse_cutpoints;
+static bool online_blocks;
 static GArray *explicit_cutpoints;
 static bool initialized;
 static bool finished;
@@ -98,6 +107,7 @@ static uint64_t event_sequence;
 static uint64_t event_epoch;
 static bool pending_svc;
 static uint64_t pending_svc_pc;
+static uint64_t online_tb_last_pc;
 static GArray *pending_stores;
 
 static GHashTable *registers;
@@ -266,6 +276,8 @@ static bool parse_options(int argc, char **argv)
             }
         } else if (strcmp(option, "coarse=on") == 0) {
             coarse_cutpoints = true;
+        } else if (strcmp(option, "online-blocks=on") == 0) {
+            online_blocks = true;
         } else if (g_str_has_prefix(option, "cutpoint=")) {
             uint64_t address;
             if (!parse_address(option + strlen("cutpoint="), &address)) {
@@ -542,23 +554,49 @@ static uint64_t read_register_u64(const char *name)
     return get_u64_le(value->data);
 }
 
-static void execute_instruction(unsigned int cpu_index, void *userdata)
+static void flush_pending_events(unsigned int cpu_index, uint64_t successor_pc)
 {
-    InstructionMetadata *metadata = userdata;
-    if (finished) return;
-
     for (guint index = 0; index < pending_stores->len; index++) {
         PendingStore *store = &g_array_index(pending_stores, PendingStore, index);
-        send_event(cpu_index, EVENT_STORE, metadata->address, store->address,
+        send_event(cpu_index, EVENT_STORE, store->pc, store->address,
                    store->size, 0, store->value);
     }
     g_array_set_size(pending_stores, 0);
 
     if (pending_svc) {
         uint64_t result = read_register_u64("x0");
-        send_event(cpu_index, EVENT_AARCH64_SVC_SUCCESSOR, metadata->address,
+        send_event(cpu_index, EVENT_AARCH64_SVC_SUCCESSOR, successor_pc,
                    pending_svc_pc, 0, result, NULL);
         pending_svc = false;
+    }
+}
+
+static void execute_translation_block(unsigned int cpu_index, void *userdata)
+{
+    TranslationBlockMetadata *metadata = userdata;
+    if (finished) return;
+
+    online_tb_last_pc = metadata->last_pc;
+    send_event(cpu_index, EVENT_TRANSLATION_BLOCK, metadata->first_pc,
+               metadata->last_pc, metadata->instruction_count, 0, NULL);
+}
+
+static void execute_instruction(unsigned int cpu_index, void *userdata)
+{
+    InstructionMetadata *metadata = userdata;
+    if (finished) return;
+
+    if (!online_blocks) {
+        flush_pending_events(cpu_index, metadata->address);
+    } else {
+        /* Preserve program order for stores followed by another instruction in
+         * the same TB.  Final stores are flushed by the next TB callback. */
+        for (guint index = 0; index < pending_stores->len; index++) {
+            PendingStore *store = &g_array_index(pending_stores, PendingStore, index);
+            send_event(cpu_index, EVENT_STORE, store->pc, store->address,
+                       store->size, 0, store->value);
+        }
+        g_array_set_size(pending_stores, 0);
     }
     if (metadata->svc) {
         uint64_t number = read_register_u64("x8");
@@ -573,13 +611,47 @@ static void execute_instruction(unsigned int cpu_index, void *userdata)
     }
 }
 
+static void syscall_entry(qemu_plugin_id_t id, unsigned int cpu_index,
+                          int64_t number, uint64_t argument0, uint64_t argument1,
+                          uint64_t argument2, uint64_t argument3, uint64_t argument4,
+                          uint64_t argument5, uint64_t argument6, uint64_t argument7)
+{
+    (void)id;
+    (void)argument1;
+    (void)argument2;
+    (void)argument3;
+    (void)argument4;
+    (void)argument5;
+    (void)argument6;
+    (void)argument7;
+    if (!online_blocks || finished) return;
+    if (pending_svc) protocol_failure("nested online syscall entry");
+    send_event(cpu_index, EVENT_AARCH64_SVC_ENTRY, online_tb_last_pc,
+               argument0, 0, (uint64_t)number, NULL);
+    pending_svc = true;
+    pending_svc_pc = online_tb_last_pc;
+}
+
+static void syscall_return(qemu_plugin_id_t id, unsigned int cpu_index,
+                           int64_t number, int64_t result)
+{
+    (void)id;
+    (void)number;
+    if (!online_blocks || finished) return;
+    if (!pending_svc) protocol_failure("online syscall return without entry");
+    send_event(cpu_index, EVENT_AARCH64_SVC_SUCCESSOR, 0,
+               pending_svc_pc, 0, (uint64_t)result, NULL);
+    pending_svc = false;
+}
+
 static void record_store(unsigned int cpu_index, qemu_plugin_meminfo_t info,
                          uint64_t vaddr, void *userdata)
 {
     (void)cpu_index;
     (void)userdata;
     qemu_plugin_mem_value accessed = qemu_plugin_mem_get_value(info);
-    PendingStore store = { .address = vaddr };
+    InstructionMetadata *metadata = userdata;
+    PendingStore store = { .pc = metadata->address, .address = vaddr };
     switch (accessed.type) {
     case QEMU_PLUGIN_MEM_VALUE_U8: store.size = 1; store.value[0] = accessed.data.u8; break;
     case QEMU_PLUGIN_MEM_VALUE_U16: store.size = 2; memcpy(store.value, &accessed.data.u16, 2); break;
@@ -612,6 +684,32 @@ static void instrument_translation_block(
 {
     (void)id;
     size_t instruction_count = qemu_plugin_tb_n_insns(translation_block);
+    if (online_blocks) {
+        if (instruction_count == 0) {
+            protocol_failure("translated an empty block");
+        }
+        TranslationBlockMetadata *block = g_new0(TranslationBlockMetadata, 1);
+        block->instruction_count = instruction_count;
+        for (size_t index = 0; index < instruction_count; index++) {
+            uint64_t address = qemu_plugin_insn_vaddr(
+                qemu_plugin_tb_get_insn(translation_block, index)
+            );
+            if ((index != 0 && address != block->last_pc + 4) ||
+                address < start_address || address > stop_address) {
+                protocol_failure("online block is not contiguous in the declared image");
+            }
+            if (index == 0) block->first_pc = address;
+            block->last_pc = address;
+        }
+        qemu_plugin_register_vcpu_tb_exec_cb(
+            translation_block, execute_translation_block,
+            QEMU_PLUGIN_CB_R_REGS, block
+        );
+        /* Online validation must leave the translated guest block intact.  In
+         * particular, no instruction inline op, execution callback, or memory
+         * callback may become a TCG optimizer barrier. */
+        return;
+    }
     for (size_t index = 0; index < instruction_count; index++) {
         struct qemu_plugin_insn *instruction =
             qemu_plugin_tb_get_insn(translation_block, index);
@@ -644,7 +742,7 @@ static void instrument_translation_block(
         );
         qemu_plugin_register_vcpu_mem_cb(
             instruction, record_store, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_MEM_W, NULL
+            QEMU_PLUGIN_MEM_W, metadata
         );
     }
 }
@@ -701,6 +799,8 @@ int qemu_plugin_install(
 
     qemu_plugin_register_vcpu_init_cb(id, initialize_vcpu);
     qemu_plugin_register_vcpu_tb_trans_cb(id, instrument_translation_block);
+    qemu_plugin_register_vcpu_syscall_cb(id, syscall_entry);
+    qemu_plugin_register_vcpu_syscall_ret_cb(id, syscall_return);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     return 0;
 }
