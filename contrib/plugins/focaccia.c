@@ -14,14 +14,22 @@
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 #define DEFAULT_SOCKET_PATH "/tmp/focaccia.sock"
-#define PROTOCOL_VERSION 2u
+#define PROTOCOL_VERSION 3u
 #define PROTOCOL_FAILURE_STATUS 125
-#define HANDSHAKE_SIZE 40u
+#define HANDSHAKE_SIZE 176u
 #define COMMAND_SIZE 32u
 #define REGISTER_RESPONSE_SIZE 104u
 #define MEMORY_RESPONSE_SIZE 24u
-#define ACK_SIZE 8u
+#define ACK_SIZE 16u
 #define MAX_REGISTER_BYTES 64u
+#define IDENTITY_DIGEST_SIZE 32u
+
+#define CAP_PC (1ull << 0)
+#define CAP_INTEGER (1ull << 1)
+#define CAP_STATUS (1ull << 2)
+#define CAP_VECTOR (1ull << 3)
+#define CAP_TLS (1ull << 4)
+#define CAP_AARCH64_SVC (1ull << 5)
 #define REGISTER_NAME_SIZE 32u
 
 #define COMMAND_READ_REGISTER 1u
@@ -29,6 +37,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define COMMAND_STEP 3u
 #define COMMAND_FINISH 4u
 #define COMMAND_ABORT 5u
+
+#define EVENT_CUTPOINT 1u
+#define EVENT_STORE 2u
+#define EVENT_AARCH64_SVC_ENTRY 3u
+#define EVENT_AARCH64_SVC_SUCCESSOR 4u
+#define EVENT_SIZE 96u
 
 #define RESPONSE_OK 0u
 #define RESPONSE_UNAVAILABLE 1u
@@ -39,19 +53,31 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 static const uint8_t protocol_magic[8] = {
     'F', 'O', 'C', 'P', 'L', 'U', 'G', 0,
 };
-static const uint8_t handshake_ack[ACK_SIZE] = {
-    'F', 'O', 'C', 'A', 'C', 'P', 'T', '2',
+static const uint8_t handshake_ack_magic[8] = {
+    'F', 'O', 'C', 'A', 'C', 'P', 'T', '3',
 };
 static const uint8_t finish_ack[ACK_SIZE] = {
-    'F', 'O', 'C', 'F', 'I', 'N', '0', '2',
+    'F', 'O', 'C', 'F', 'I', 'N', '0', '3', 0, 0, 0, 0, 0, 0, 0, 0,
 };
 static const uint8_t abort_ack[ACK_SIZE] = {
-    'F', 'O', 'C', 'A', 'B', 'R', '0', '2',
+    'F', 'O', 'C', 'A', 'B', 'R', '0', '3', 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
 typedef struct {
     uint64_t instruction_address;
 } FocacciaScoreboard;
+
+typedef struct {
+    uint64_t address;
+    uint64_t size;
+    uint8_t value[16];
+} PendingStore;
+
+typedef struct {
+    uint64_t address;
+    bool cutpoint;
+    bool svc;
+} InstructionMetadata;
 
 static int socket_fd = -1;
 static char *socket_path;
@@ -65,6 +91,14 @@ static uint64_t stop_address = UINT64_MAX;
 static bool coarse_cutpoints;
 static bool initialized;
 static bool finished;
+static uint8_t launch_identity[4][IDENTITY_DIGEST_SIZE];
+static bool identity_present[4];
+static uint64_t capabilities;
+static uint64_t event_sequence;
+static uint64_t event_epoch;
+static bool pending_svc;
+static uint64_t pending_svc_pc;
+static GArray *pending_stores;
 
 static GHashTable *registers;
 static struct qemu_plugin_scoreboard *scoreboard;
@@ -194,6 +228,22 @@ static bool select_target(const qemu_info_t *info)
     return true;
 }
 
+static bool parse_hex_digest(const char *text, uint8_t destination[IDENTITY_DIGEST_SIZE])
+{
+    if (strlen(text) != IDENTITY_DIGEST_SIZE * 2) {
+        return false;
+    }
+    for (size_t index = 0; index < IDENTITY_DIGEST_SIZE; index++) {
+        int high = g_ascii_xdigit_value(text[index * 2]);
+        int low = g_ascii_xdigit_value(text[index * 2 + 1]);
+        if (high < 0 || low < 0) {
+            return false;
+        }
+        destination[index] = (uint8_t)((high << 4) | low);
+    }
+    return true;
+}
+
 static bool parse_options(int argc, char **argv)
 {
     socket_path = g_strdup(DEFAULT_SOCKET_PATH);
@@ -216,6 +266,18 @@ static bool parse_options(int argc, char **argv)
             }
         } else if (strcmp(option, "coarse=on") == 0) {
             coarse_cutpoints = true;
+        } else if (g_str_has_prefix(option, "binary-sha256=")) {
+            identity_present[0] = parse_hex_digest(option + 14, launch_identity[0]);
+            if (!identity_present[0]) return false;
+        } else if (g_str_has_prefix(option, "argv-sha256=")) {
+            identity_present[1] = parse_hex_digest(option + 12, launch_identity[1]);
+            if (!identity_present[1]) return false;
+        } else if (g_str_has_prefix(option, "env-sha256=")) {
+            identity_present[2] = parse_hex_digest(option + 11, launch_identity[2]);
+            if (!identity_present[2]) return false;
+        } else if (g_str_has_prefix(option, "cpu-sha256=")) {
+            identity_present[3] = parse_hex_digest(option + 11, launch_identity[3]);
+            if (!identity_present[3]) return false;
         } else {
             fprintf(stderr, "Unknown Focaccia plugin option: %s\n", option);
             return false;
@@ -223,6 +285,8 @@ static bool parse_options(int argc, char **argv)
     }
 
     if (start_address > stop_address ||
+        !identity_present[0] || !identity_present[1] ||
+        !identity_present[2] || !identity_present[3] ||
         strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
         return false;
     }
@@ -255,11 +319,17 @@ static void connect_to_validator(void)
     handshake[33] = 64;
     handshake[34] = plugin_api_min;
     handshake[35] = plugin_api_current;
+    put_u64_le(handshake + 40, capabilities);
+    memcpy(handshake + 48, launch_identity, sizeof(launch_identity));
 
     if (!write_full(socket_fd, handshake, sizeof(handshake)) ||
         !read_full(socket_fd, acknowledgement, sizeof(acknowledgement)) ||
-        memcmp(acknowledgement, handshake_ack, sizeof(handshake_ack)) != 0) {
-        protocol_failure("protocol negotiation failed");
+        memcmp(acknowledgement, handshake_ack_magic,
+               sizeof(handshake_ack_magic)) != 0 ||
+        get_u64_le(acknowledgement + 8) == 0 ||
+        (get_u64_le(acknowledgement + 8) & capabilities) !=
+            get_u64_le(acknowledgement + 8)) {
+        protocol_failure("protocol/capability negotiation failed");
     }
 }
 
@@ -284,6 +354,21 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
 
     if (g_hash_table_lookup(registers, pc_register) == NULL) {
         protocol_failure("program counter register is unavailable");
+    }
+    capabilities = CAP_PC;
+    if (strcmp(target_name, "x86_64") == 0) {
+        if (g_hash_table_lookup(registers, "rax") != NULL) capabilities |= CAP_INTEGER;
+        if (g_hash_table_lookup(registers, "eflags") != NULL) capabilities |= CAP_STATUS;
+        if (g_hash_table_lookup(registers, "xmm0") != NULL) capabilities |= CAP_VECTOR;
+        if (g_hash_table_lookup(registers, "fs_base") != NULL) capabilities |= CAP_TLS;
+    } else {
+        if (g_hash_table_lookup(registers, "x0") != NULL &&
+            g_hash_table_lookup(registers, "x8") != NULL) {
+            capabilities |= CAP_INTEGER | CAP_AARCH64_SVC;
+        }
+        if (g_hash_table_lookup(registers, "cpsr") != NULL) capabilities |= CAP_STATUS;
+        if (g_hash_table_lookup(registers, "q0") != NULL) capabilities |= CAP_VECTOR;
+        if (g_hash_table_lookup(registers, "TPIDR_EL0") != NULL) capabilities |= CAP_TLS;
     }
     connect_to_validator();
 }
@@ -371,15 +456,9 @@ static bool reserved_command_bytes_are_zero(const uint8_t *command)
     return true;
 }
 
-static void execute_instruction(unsigned int cpu_index, void *userdata)
+static void command_loop(unsigned int cpu_index)
 {
     uint8_t command[COMMAND_SIZE];
-    (void)userdata;
-
-    if (finished) {
-        return;
-    }
-
     while (true) {
         if (!read_full(socket_fd, command, sizeof(command))) {
             protocol_failure("validator disconnected during an instruction callback");
@@ -416,6 +495,89 @@ static void execute_instruction(unsigned int cpu_index, void *userdata)
     }
 }
 
+static void send_event(unsigned int cpu_index, uint8_t kind, uint64_t pc,
+                       uint64_t address, uint64_t size, uint64_t auxiliary,
+                       const uint8_t value[16])
+{
+    uint8_t event[EVENT_SIZE] = {0};
+    event[0] = kind;
+    put_u64_le(event + 8, ++event_sequence);
+    put_u64_le(event + 16, ++event_epoch);
+    put_u64_le(event + 24, pc);
+    put_u64_le(event + 32, address);
+    put_u64_le(event + 40, size);
+    put_u64_le(event + 48, auxiliary);
+    if (value != NULL) memcpy(event + 56, value, 16);
+    if (!write_full(socket_fd, event, sizeof(event))) {
+        protocol_failure("unable to send ordered event");
+    }
+    command_loop(cpu_index);
+}
+
+static uint64_t read_register_u64(const char *name)
+{
+    struct qemu_plugin_register *handle = g_hash_table_lookup(registers, name);
+    g_autoptr(GByteArray) value = g_byte_array_new();
+    if (handle == NULL || qemu_plugin_read_register(handle, value) <= 0 ||
+        value->len < sizeof(uint64_t)) {
+        protocol_failure("required event register became unavailable");
+    }
+    return get_u64_le(value->data);
+}
+
+static void execute_instruction(unsigned int cpu_index, void *userdata)
+{
+    InstructionMetadata *metadata = userdata;
+    if (finished) return;
+
+    for (guint index = 0; index < pending_stores->len; index++) {
+        PendingStore *store = &g_array_index(pending_stores, PendingStore, index);
+        send_event(cpu_index, EVENT_STORE, metadata->address, store->address,
+                   store->size, 0, store->value);
+    }
+    g_array_set_size(pending_stores, 0);
+
+    if (pending_svc) {
+        uint64_t result = read_register_u64("x0");
+        send_event(cpu_index, EVENT_AARCH64_SVC_SUCCESSOR, metadata->address,
+                   pending_svc_pc, 0, result, NULL);
+        pending_svc = false;
+    }
+    if (metadata->svc) {
+        uint64_t number = read_register_u64("x8");
+        uint64_t argument = read_register_u64("x0");
+        send_event(cpu_index, EVENT_AARCH64_SVC_ENTRY, metadata->address,
+                   argument, 0, number, NULL);
+        pending_svc = true;
+        pending_svc_pc = metadata->address;
+    }
+    if (metadata->cutpoint) {
+        send_event(cpu_index, EVENT_CUTPOINT, metadata->address, 0, 0, 0, NULL);
+    }
+}
+
+static void record_store(unsigned int cpu_index, qemu_plugin_meminfo_t info,
+                         uint64_t vaddr, void *userdata)
+{
+    (void)cpu_index;
+    (void)userdata;
+    qemu_plugin_mem_value accessed = qemu_plugin_mem_get_value(info);
+    PendingStore store = { .address = vaddr };
+    switch (accessed.type) {
+    case QEMU_PLUGIN_MEM_VALUE_U8: store.size = 1; store.value[0] = accessed.data.u8; break;
+    case QEMU_PLUGIN_MEM_VALUE_U16: store.size = 2; memcpy(store.value, &accessed.data.u16, 2); break;
+    case QEMU_PLUGIN_MEM_VALUE_U32: store.size = 4; memcpy(store.value, &accessed.data.u32, 4); break;
+    case QEMU_PLUGIN_MEM_VALUE_U64: store.size = 8; memcpy(store.value, &accessed.data.u64, 8); break;
+    case QEMU_PLUGIN_MEM_VALUE_U128:
+        store.size = 16;
+        memcpy(store.value, &accessed.data.u128.low, 8);
+        memcpy(store.value + 8, &accessed.data.u128.high, 8);
+        break;
+    default: protocol_failure("unsupported store width");
+    }
+    g_array_append_val(pending_stores, store);
+}
+
 static void instrument_translation_block(
     qemu_plugin_id_t id,
     struct qemu_plugin_tb *translation_block
@@ -427,10 +589,20 @@ static void instrument_translation_block(
         struct qemu_plugin_insn *instruction =
             qemu_plugin_tb_get_insn(translation_block, index);
         uint64_t address = qemu_plugin_insn_vaddr(instruction);
-        if (address < start_address || address > stop_address ||
-            (coarse_cutpoints && address != start_address && address != stop_address)) {
-            continue;
+        if (address < start_address || address > stop_address) continue;
+        uint32_t opcode = 0;
+        bool svc = false;
+        if (strcmp(target_name, "aarch64") == 0 ||
+            strcmp(target_name, "aarch64_be") == 0) {
+            if (qemu_plugin_insn_data(instruction, &opcode, sizeof(opcode)) == sizeof(opcode)) {
+                svc = (opcode & 0xffe0001fu) == 0xd4000001u;
+            }
         }
+        InstructionMetadata *metadata = g_new0(InstructionMetadata, 1);
+        metadata->address = address;
+        metadata->svc = svc;
+        metadata->cutpoint = !coarse_cutpoints || address == start_address ||
+                             address == stop_address;
         qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
             instruction,
             QEMU_PLUGIN_INLINE_STORE_U64,
@@ -441,7 +613,11 @@ static void instrument_translation_block(
             instruction,
             execute_instruction,
             QEMU_PLUGIN_CB_R_REGS,
-            NULL
+            metadata
+        );
+        qemu_plugin_register_vcpu_mem_cb(
+            instruction, record_store, QEMU_PLUGIN_CB_NO_REGS,
+            QEMU_PLUGIN_MEM_W, NULL
         );
     }
 }
@@ -457,6 +633,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     if (registers != NULL) {
         g_hash_table_destroy(registers);
         registers = NULL;
+    }
+    if (pending_stores != NULL) {
+        g_array_free(pending_stores, true);
+        pending_stores = NULL;
     }
     if (scoreboard != NULL) {
         qemu_plugin_scoreboard_free(scoreboard);
@@ -479,6 +659,7 @@ int qemu_plugin_install(
     }
 
     registers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    pending_stores = g_array_new(false, false, sizeof(PendingStore));
     scoreboard = qemu_plugin_scoreboard_new(sizeof(FocacciaScoreboard));
     instruction_address = qemu_plugin_scoreboard_u64_in_struct(
         scoreboard,
