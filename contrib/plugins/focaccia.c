@@ -384,7 +384,7 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
             capabilities |= CAP_INTEGER | CAP_AARCH64_SVC;
         }
         if (g_hash_table_lookup(registers, "cpsr") != NULL) capabilities |= CAP_STATUS;
-        if (g_hash_table_lookup(registers, "q0") != NULL) capabilities |= CAP_VECTOR;
+        if (g_hash_table_lookup(registers, "v0") != NULL) capabilities |= CAP_VECTOR;
         if (g_hash_table_lookup(registers, "TPIDR_EL0") != NULL) capabilities |= CAP_TLS;
     }
     connect_to_validator();
