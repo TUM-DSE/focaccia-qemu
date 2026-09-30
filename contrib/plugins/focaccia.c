@@ -14,7 +14,6 @@
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 #define DEFAULT_SOCKET_PATH "/tmp/focaccia.sock"
-#define PROTOCOL_VERSION 3u
 #define PROTOCOL_FAILURE_STATUS 125
 #define HANDSHAKE_SIZE 176u
 #define COMMAND_SIZE 32u
@@ -54,13 +53,13 @@ static const uint8_t protocol_magic[8] = {
     'F', 'O', 'C', 'P', 'L', 'U', 'G', 0,
 };
 static const uint8_t handshake_ack_magic[8] = {
-    'F', 'O', 'C', 'A', 'C', 'P', 'T', '3',
+    'F', 'O', 'C', 'A', 'C', 'P', 'T', 0,
 };
 static const uint8_t finish_ack[ACK_SIZE] = {
-    'F', 'O', 'C', 'F', 'I', 'N', '0', '3', 0, 0, 0, 0, 0, 0, 0, 0,
+    'F', 'O', 'C', 'F', 'I', 'N', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 static const uint8_t abort_ack[ACK_SIZE] = {
-    'F', 'O', 'C', 'A', 'B', 'R', '0', '3', 0, 0, 0, 0, 0, 0, 0, 0,
+    'F', 'O', 'C', 'A', 'B', 'R', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
 typedef struct {
@@ -89,6 +88,7 @@ static uint8_t plugin_api_current;
 static uint64_t start_address;
 static uint64_t stop_address = UINT64_MAX;
 static bool coarse_cutpoints;
+static GArray *explicit_cutpoints;
 static bool initialized;
 static bool finished;
 static uint8_t launch_identity[4][IDENTITY_DIGEST_SIZE];
@@ -266,6 +266,12 @@ static bool parse_options(int argc, char **argv)
             }
         } else if (strcmp(option, "coarse=on") == 0) {
             coarse_cutpoints = true;
+        } else if (g_str_has_prefix(option, "cutpoint=")) {
+            uint64_t address;
+            if (!parse_address(option + strlen("cutpoint="), &address)) {
+                return false;
+            }
+            g_array_append_val(explicit_cutpoints, address);
         } else if (g_str_has_prefix(option, "binary-sha256=")) {
             identity_present[0] = parse_hex_digest(option + 14, launch_identity[0]);
             if (!identity_present[0]) return false;
@@ -290,6 +296,17 @@ static bool parse_options(int argc, char **argv)
         strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
         return false;
     }
+    for (guint index = 0; index < explicit_cutpoints->len; index++) {
+        uint64_t address = g_array_index(explicit_cutpoints, uint64_t, index);
+        if (address < start_address || address > stop_address) {
+            return false;
+        }
+        for (guint previous = 0; previous < index; previous++) {
+            if (address == g_array_index(explicit_cutpoints, uint64_t, previous)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -312,7 +329,7 @@ static void connect_to_validator(void)
     }
 
     memcpy(handshake, protocol_magic, sizeof(protocol_magic));
-    put_u32_le(handshake + 8, PROTOCOL_VERSION);
+    /* Bytes 8..11 are reserved in the single lockstep wire format. */
     put_u32_le(handshake + 12, (uint32_t)getpid());
     memcpy(handshake + 16, target_name, strlen(target_name));
     handshake[32] = target_endianness;
@@ -578,6 +595,16 @@ static void record_store(unsigned int cpu_index, qemu_plugin_meminfo_t info,
     g_array_append_val(pending_stores, store);
 }
 
+static bool is_explicit_cutpoint(uint64_t address)
+{
+    for (guint index = 0; index < explicit_cutpoints->len; index++) {
+        if (address == g_array_index(explicit_cutpoints, uint64_t, index)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void instrument_translation_block(
     qemu_plugin_id_t id,
     struct qemu_plugin_tb *translation_block
@@ -602,7 +629,7 @@ static void instrument_translation_block(
         metadata->address = address;
         metadata->svc = svc;
         metadata->cutpoint = !coarse_cutpoints || address == start_address ||
-                             address == stop_address;
+                             address == stop_address || is_explicit_cutpoint(address);
         qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
             instruction,
             QEMU_PLUGIN_INLINE_STORE_U64,
@@ -638,6 +665,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         g_array_free(pending_stores, true);
         pending_stores = NULL;
     }
+    if (explicit_cutpoints != NULL) {
+        g_array_free(explicit_cutpoints, true);
+        explicit_cutpoints = NULL;
+    }
     if (scoreboard != NULL) {
         qemu_plugin_scoreboard_free(scoreboard);
         scoreboard = NULL;
@@ -653,6 +684,7 @@ int qemu_plugin_install(
     char **argv
 )
 {
+    explicit_cutpoints = g_array_new(false, false, sizeof(uint64_t));
     if (info->system_emulation || !select_target(info) || !parse_options(argc, argv)) {
         fprintf(stderr, "Unsupported Focaccia plugin target or options\n");
         return -1;
