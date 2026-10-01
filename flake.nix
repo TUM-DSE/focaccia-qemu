@@ -58,7 +58,9 @@
 
           postInstall = (old.postInstall or "") + ''
             mkdir -p $out/lib/plugins/
-            cc -fPIC -shared ${./contrib/plugins/focaccia.c} \
+            cc -fPIC -shared \
+              ${./contrib/plugins/focaccia.c} \
+              ${./contrib/plugins/focaccia-plan.c} \
               -o $out/lib/plugins/libfocaccia.so \
               -I$out/include/ \
               $(pkg-config --cflags glib-2.0) \
@@ -104,6 +106,8 @@
         plugin-source = pkgs.runCommand "focaccia-qemu-plugin-source" { } ''
           mkdir -p "$out/contrib/plugins"
           cp ${./contrib/plugins/focaccia.c} "$out/contrib/plugins/focaccia.c"
+          cp ${./contrib/plugins/focaccia-plan.c} "$out/contrib/plugins/focaccia-plan.c"
+          cp ${./contrib/plugins/focaccia-plan.h} "$out/contrib/plugins/focaccia-plan.h"
         '';
 
         default = referenceQemu;
