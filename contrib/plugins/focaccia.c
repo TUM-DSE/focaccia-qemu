@@ -11,6 +11,8 @@
 
 #include <qemu-plugin.h>
 
+#include "focaccia-plan.h"
+
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 #define DEFAULT_SOCKET_PATH "/tmp/focaccia.sock"
@@ -24,6 +26,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define IDENTITY_DIGEST_SIZE 32u
 #define MAX_SNAPSHOT_PLANS 4096u
 #define MAX_PLAN_REGISTERS 32u
+#define MAX_PLAN_MEMORY 32u
+#define MAX_RECIPE_BYTES 640u
+#define MAX_SNAPSHOT_MEMORY_BYTES 65536u
 #define PLAN_REGISTER_SIZE 16u
 #define PLAN_ACK_SIZE 32u
 #define SNAPSHOT_HEADER_SIZE 40u
@@ -96,12 +101,25 @@ typedef struct {
 } TranslationBlockMetadata;
 
 typedef struct {
+    uint16_t size;
+    uint16_t recipe_size;
+    uint8_t recipe[MAX_RECIPE_BYTES];
+} SnapshotMemoryPlan;
+
+typedef struct {
     uint64_t pc;
     uint64_t generation;
     uint64_t occurrences;
     uint32_t register_count;
+    uint32_t memory_count;
     char registers[MAX_PLAN_REGISTERS][PLAN_REGISTER_SIZE];
+    SnapshotMemoryPlan memory[MAX_PLAN_MEMORY];
 } SnapshotPlan;
+
+typedef struct {
+    SnapshotPlan *plan;
+    uint8_t (*register_values)[SNAPSHOT_VALUE_SIZE + 8];
+} RecipeCapture;
 
 static int socket_fd = -1;
 static char *socket_path;
@@ -509,10 +527,12 @@ static void install_snapshot_plan(const uint8_t *command)
     uint64_t pc = get_u64_le(command + 8);
     uint64_t generation = get_u64_le(command + 16);
     uint32_t count = get_u32_le(command + 24);
+    uint32_t memory_count = get_u32_le(command + 28);
     uint8_t acknowledgement[PLAN_ACK_SIZE] = {0};
 
     if (!online_blocks || !at_tb_boundary || pc != boundary_pc || generation == 0 ||
-        count == 0 || count > MAX_PLAN_REGISTERS) {
+        count > MAX_PLAN_REGISTERS || memory_count > MAX_PLAN_MEMORY ||
+        count + memory_count == 0) {
         protocol_failure("invalid snapshot plan identity or bounds");
     }
     SnapshotPlan *old = g_hash_table_lookup(snapshot_plans, &pc);
@@ -525,6 +545,7 @@ static void install_snapshot_plan(const uint8_t *command)
     plan->pc = pc;
     plan->generation = generation;
     plan->register_count = count;
+    plan->memory_count = memory_count;
     for (uint32_t index = 0; index < count; index++) {
         if (!read_full(socket_fd, plan->registers[index], PLAN_REGISTER_SIZE) ||
             memchr(plan->registers[index], '\0', PLAN_REGISTER_SIZE) == NULL ||
@@ -542,14 +563,71 @@ static void install_snapshot_plan(const uint8_t *command)
             }
         }
     }
+    size_t total_memory = 0;
+    for (uint32_t index = 0; index < memory_count; index++) {
+        uint8_t descriptor[8];
+        if (!read_full(socket_fd, descriptor, sizeof(descriptor))) {
+            g_free(plan);
+            protocol_failure("truncated snapshot memory descriptor");
+        }
+        SnapshotMemoryPlan *memory = &plan->memory[index];
+        memory->size = (uint16_t)(descriptor[0] | descriptor[1] << 8);
+        memory->recipe_size = (uint16_t)(descriptor[2] | descriptor[3] << 8);
+        if (descriptor[4] || descriptor[5] || descriptor[6] || descriptor[7] ||
+            memory->size == 0 || memory->recipe_size == 0 ||
+            memory->recipe_size > MAX_RECIPE_BYTES ||
+            total_memory + memory->size > MAX_SNAPSHOT_MEMORY_BYTES ||
+            !read_full(socket_fd, memory->recipe, memory->recipe_size)) {
+            g_free(plan);
+            protocol_failure("invalid snapshot memory descriptor");
+        }
+        total_memory += memory->size;
+    }
     g_hash_table_replace(snapshot_plans, &plan->pc, plan);
     acknowledgement[0] = RESPONSE_OK;
     put_u64_le(acknowledgement + 8, pc);
     put_u64_le(acknowledgement + 16, generation);
     put_u32_le(acknowledgement + 24, count);
+    put_u32_le(acknowledgement + 28, memory_count);
     if (!write_full(socket_fd, acknowledgement, sizeof(acknowledgement))) {
         protocol_failure("unable to acknowledge snapshot plan");
     }
+}
+
+static bool recipe_read_register(void *opaque, uint8_t index,
+                                 FocacciaRecipeValue *value)
+{
+    RecipeCapture *capture = opaque;
+    if (index >= capture->plan->register_count) {
+        return false;
+    }
+    uint8_t *wire = capture->register_values[index];
+    uint8_t size = wire[0];
+    if (size == 0 || size > 8) {
+        return false;
+    }
+    value->width = size * 8;
+    value->bits = 0;
+    for (uint8_t offset = 0; offset < size; offset++) {
+        uint8_t source = target_endianness == TARGET_BIG_ENDIAN ?
+            size - offset - 1 : offset;
+        value->bits |= (uint64_t)wire[8 + source] << (offset * 8);
+    }
+    return true;
+}
+
+static bool recipe_read_memory(void *opaque, uint64_t address,
+                               uint8_t *bytes, size_t size)
+{
+    g_autoptr(GByteArray) value = g_byte_array_new();
+    (void)opaque;
+    if (size == 0 || size > 8 ||
+        !qemu_plugin_read_memory_vaddr(address, value, size) ||
+        value->len != size) {
+        return false;
+    }
+    memcpy(bytes, value->data, size);
+    return true;
 }
 
 static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command)
@@ -559,6 +637,7 @@ static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command
     SnapshotPlan *plan = g_hash_table_lookup(snapshot_plans, &pc);
     uint8_t header[SNAPSHOT_HEADER_SIZE] = {0};
     uint8_t values[MAX_PLAN_REGISTERS][SNAPSHOT_VALUE_SIZE + 8] = {{0}};
+    g_autoptr(GByteArray) memory_values = g_byte_array_new();
 
     if (!online_blocks || !at_tb_boundary || pc != boundary_pc || plan == NULL ||
         plan->generation != generation) {
@@ -587,8 +666,37 @@ static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command
             memcpy(values[index] + 8, value->data, size);
         }
     }
+    RecipeCapture capture = { plan, values };
+    FocacciaRecipeContext context = {
+        recipe_read_register, recipe_read_memory, &capture
+    };
+    for (uint32_t index = 0; index < plan->memory_count; index++) {
+        SnapshotMemoryPlan *memory = &plan->memory[index];
+        FocacciaRecipeValue address;
+        g_autoptr(GByteArray) data = g_byte_array_new();
+        if (!focaccia_recipe_eval(memory->recipe, memory->recipe_size,
+                                  &context, &address) ||
+            address.width != 64 ||
+            !qemu_plugin_read_memory_vaddr(address.bits, data, memory->size) ||
+            data->len != memory->size) {
+            header[0] = RESPONSE_UNAVAILABLE;
+            put_u64_le(header + 8, pc);
+            put_u64_le(header + 16, generation);
+            put_u64_le(header + 24, plan->occurrences);
+            if (!write_full(socket_fd, header, sizeof(header))) {
+                protocol_failure("unable to send unavailable memory snapshot");
+            }
+            return;
+        }
+        uint8_t descriptor[16] = {0};
+        put_u64_le(descriptor, address.bits);
+        put_u32_le(descriptor + 8, memory->size);
+        g_byte_array_append(memory_values, descriptor, sizeof(descriptor));
+        g_byte_array_append(memory_values, data->data, data->len);
+    }
     plan->occurrences++;
     header[0] = RESPONSE_OK;
+    header[2] = (uint8_t)plan->memory_count;
     put_u32_le(header + 4, plan->register_count);
     put_u64_le(header + 8, pc);
     put_u64_le(header + 16, generation);
@@ -596,7 +704,8 @@ static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command
     put_u64_le(header + 32, event_sequence);
     if (!write_full(socket_fd, header, sizeof(header)) ||
         !write_full(socket_fd, values,
-                    plan->register_count * (SNAPSHOT_VALUE_SIZE + 8))) {
+                    plan->register_count * (SNAPSHOT_VALUE_SIZE + 8)) ||
+        !write_full(socket_fd, memory_values->data, memory_values->len)) {
         protocol_failure("unable to send boundary snapshot");
     }
     (void)cpu_index;
