@@ -133,6 +133,7 @@ static uint64_t start_address;
 static uint64_t stop_address = UINT64_MAX;
 static bool coarse_cutpoints;
 static bool online_blocks;
+static bool automatic_snapshots = true;
 static GArray *explicit_cutpoints;
 static bool initialized;
 static bool finished;
@@ -327,6 +328,8 @@ static bool parse_options(int argc, char **argv)
             coarse_cutpoints = true;
         } else if (strcmp(option, "online-blocks=on") == 0) {
             online_blocks = true;
+        } else if (strcmp(option, "automatic-snapshots=off") == 0) {
+            automatic_snapshots = false;
         } else if (g_str_has_prefix(option, "cutpoint=")) {
             uint64_t address;
             if (!parse_address(option + strlen("cutpoint="), &address)) {
@@ -835,7 +838,7 @@ static void execute_translation_block(unsigned int cpu_index, void *userdata)
     boundary_pc = metadata->first_pc;
     at_tb_boundary = true;
     SnapshotPlan *plan = g_hash_table_lookup(snapshot_plans, &boundary_pc);
-    if (plan != NULL && plan->memory_count == 0 &&
+    if (automatic_snapshots && plan != NULL && plan->memory_count == 0 &&
         plan->predecessor_pc == previous_boundary_pc) {
         uint8_t command[COMMAND_SIZE] = { COMMAND_CAPTURE_PLAN };
         put_u64_le(command + 8, boundary_pc);
