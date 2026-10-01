@@ -7,6 +7,17 @@ static uint64_t mask(uint8_t width)
     return width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
 }
 
+static uint64_t get_u64_le(const uint8_t *bytes)
+{
+    uint64_t value = 0;
+    unsigned int i;
+
+    for (i = 0; i < 8; i++) {
+        value |= (uint64_t)bytes[i] << (8 * i);
+    }
+    return value;
+}
+
 bool focaccia_recipe_eval(const uint8_t *code, size_t size,
                           const FocacciaRecipeContext *ctx,
                           FocacciaRecipeValue *out)
@@ -27,7 +38,7 @@ bool focaccia_recipe_eval(const uint8_t *code, size_t size,
         if (op == FOCACCIA_RECIPE_CONST) {
             NEED(9); width = code[pc++];
             if (!width || width > 64) return false;
-            v.bits = 0; memcpy(&v.bits, code + pc, 8); pc += 8;
+            v.bits = get_u64_le(code + pc); pc += 8;
             v.width = width; v.bits &= mask(width); PUSH(v); continue;
         }
         if (op == FOCACCIA_RECIPE_REG) {
@@ -39,10 +50,11 @@ bool focaccia_recipe_eval(const uint8_t *code, size_t size,
         if (op == FOCACCIA_RECIPE_LOAD) {
             NEED(1); width = code[pc++];
             if (!width || width > 64 || (width & 7) || !sp || ++reads > FOCACCIA_RECIPE_MAX_READS) return false;
-            a = stack[--sp]; v.bits = 0; v.width = width;
+            a = stack[--sp]; v.width = width;
+            uint8_t bytes[8] = {0};
             if (!ctx->read_memory || !ctx->read_memory(ctx->opaque, a.bits,
-                                                       (uint8_t *)&v.bits, width / 8)) return false;
-            v.bits &= mask(width); PUSH(v); continue;
+                                                       bytes, width / 8)) return false;
+            v.bits = get_u64_le(bytes) & mask(width); PUSH(v); continue;
         }
         if (op == FOCACCIA_RECIPE_ZEXT || op == FOCACCIA_RECIPE_SEXT) {
             NEED(1); width = code[pc++]; if (!sp || !width || width > 64) return false;

@@ -2,6 +2,7 @@
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
 
 tests = {
+  'test-focaccia-plan': [meson.project_source_root() / 'contrib/plugins/focaccia-plan.c'],
   'check-block-qdict': [],
   'check-qdict': [],
   'check-qnum': [],
