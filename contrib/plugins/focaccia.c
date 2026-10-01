@@ -110,6 +110,7 @@ typedef struct {
     uint64_t pc;
     uint64_t generation;
     uint64_t occurrences;
+    uint64_t predecessor_pc;
     uint32_t register_count;
     uint32_t memory_count;
     char registers[MAX_PLAN_REGISTERS][PLAN_REGISTER_SIZE];
@@ -146,6 +147,7 @@ static uint64_t online_tb_last_pc;
 static GArray *pending_stores;
 static GHashTable *snapshot_plans;
 static uint64_t boundary_pc;
+static uint64_t previous_boundary_pc = UINT64_MAX;
 static bool at_tb_boundary;
 
 static GHashTable *registers;
@@ -544,6 +546,7 @@ static void install_snapshot_plan(const uint8_t *command)
     SnapshotPlan *plan = g_new0(SnapshotPlan, 1);
     plan->pc = pc;
     plan->generation = generation;
+    plan->predecessor_pc = previous_boundary_pc;
     plan->register_count = count;
     plan->memory_count = memory_count;
     for (uint32_t index = 0; index < count; index++) {
@@ -630,7 +633,7 @@ static bool recipe_read_memory(void *opaque, uint64_t address,
     return true;
 }
 
-static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command)
+static bool capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command)
 {
     uint64_t pc = get_u64_le(command + 8);
     uint64_t generation = get_u64_le(command + 16);
@@ -660,7 +663,7 @@ static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command
                 if (!write_full(socket_fd, header, sizeof(header))) {
                     protocol_failure("unable to send unavailable snapshot");
                 }
-                return;
+                return false;
             }
             values[index][0] = (uint8_t)size;
             memcpy(values[index] + 8, value->data, size);
@@ -686,7 +689,7 @@ static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command
             if (!write_full(socket_fd, header, sizeof(header))) {
                 protocol_failure("unable to send unavailable memory snapshot");
             }
-            return;
+            return false;
         }
         uint8_t descriptor[16] = {0};
         put_u64_le(descriptor, address.bits);
@@ -709,6 +712,7 @@ static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command
         protocol_failure("unable to send boundary snapshot");
     }
     (void)cpu_index;
+    return true;
 }
 
 static bool reserved_command_bytes_are_zero(const uint8_t *command)
@@ -743,7 +747,7 @@ static void command_loop(unsigned int cpu_index)
             install_snapshot_plan(command);
             break;
         case COMMAND_CAPTURE_PLAN:
-            capture_snapshot_plan(cpu_index, command);
+            (void)capture_snapshot_plan(cpu_index, command);
             break;
         case COMMAND_STEP:
             at_tb_boundary = false;
@@ -767,12 +771,13 @@ static void command_loop(unsigned int cpu_index)
     }
 }
 
-static void send_event(unsigned int cpu_index, uint8_t kind, uint64_t pc,
+static void send_event_wait(unsigned int cpu_index, uint8_t kind, uint64_t pc,
                        uint64_t address, uint64_t size, uint64_t auxiliary,
-                       const uint8_t value[16])
+                       const uint8_t value[16], bool automatic)
 {
     uint8_t event[EVENT_SIZE] = {0};
     event[0] = kind;
+    event[1] = automatic;
     put_u64_le(event + 8, ++event_sequence);
     put_u64_le(event + 16, ++event_epoch);
     put_u64_le(event + 24, pc);
@@ -783,7 +788,14 @@ static void send_event(unsigned int cpu_index, uint8_t kind, uint64_t pc,
     if (!write_full(socket_fd, event, sizeof(event))) {
         protocol_failure("unable to send ordered event");
     }
-    command_loop(cpu_index);
+    if (!automatic) command_loop(cpu_index);
+}
+
+static void send_event(unsigned int cpu_index, uint8_t kind, uint64_t pc,
+                       uint64_t address, uint64_t size, uint64_t auxiliary,
+                       const uint8_t value[16])
+{
+    send_event_wait(cpu_index, kind, pc, address, size, auxiliary, value, false);
 }
 
 static uint64_t read_register_u64(const char *name)
@@ -822,8 +834,25 @@ static void execute_translation_block(unsigned int cpu_index, void *userdata)
     online_tb_last_pc = metadata->last_pc;
     boundary_pc = metadata->first_pc;
     at_tb_boundary = true;
-    send_event(cpu_index, EVENT_TRANSLATION_BLOCK, metadata->first_pc,
-               metadata->last_pc, metadata->instruction_count, 0, NULL);
+    SnapshotPlan *plan = g_hash_table_lookup(snapshot_plans, &boundary_pc);
+    if (plan != NULL && plan->memory_count == 0 &&
+        plan->predecessor_pc == previous_boundary_pc) {
+        uint8_t command[COMMAND_SIZE] = { COMMAND_CAPTURE_PLAN };
+        put_u64_le(command + 8, boundary_pc);
+        put_u64_le(command + 16, plan->generation);
+        send_event_wait(cpu_index, EVENT_TRANSLATION_BLOCK, metadata->first_pc,
+                        metadata->last_pc, metadata->instruction_count, 0, NULL, true);
+        if (capture_snapshot_plan(cpu_index, command)) {
+            at_tb_boundary = false;
+            previous_boundary_pc = boundary_pc;
+            return;
+        }
+        command_loop(cpu_index);
+    } else {
+        send_event(cpu_index, EVENT_TRANSLATION_BLOCK, metadata->first_pc,
+                   metadata->last_pc, metadata->instruction_count, 0, NULL);
+    }
+    previous_boundary_pc = boundary_pc;
 }
 
 static void execute_instruction(unsigned int cpu_index, void *userdata)
