@@ -530,6 +530,8 @@ static void install_snapshot_plan(const uint8_t *command)
             memchr(plan->registers[index], '\0', PLAN_REGISTER_SIZE) == NULL ||
             plan->registers[index][0] == '\0' ||
             g_hash_table_lookup(registers, plan->registers[index]) == NULL) {
+            fprintf(stderr, "Rejected snapshot register: %.*s\n",
+                    (int)PLAN_REGISTER_SIZE, plan->registers[index]);
             g_free(plan);
             protocol_failure("invalid snapshot plan register");
         }
