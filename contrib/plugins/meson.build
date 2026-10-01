@@ -15,7 +15,11 @@ if get_option('plugins')
                         link_args: win32_qemu_plugin_api_link_flags,
                         dependencies: glib)
     else
-      t += shared_module(i, files(i + '.c'),
+      sources = files(i + '.c')
+      if i == 'focaccia'
+        sources += files('focaccia-plan.c')
+      endif
+      t += shared_module(i, sources,
                         include_directories: '../../include/qemu',
                         dependencies: glib)
     endif
