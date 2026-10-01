@@ -27,7 +27,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define MAX_SNAPSHOT_PLANS 4096u
 #define MAX_PLAN_REGISTERS 32u
 #define MAX_PLAN_MEMORY 32u
-#define MAX_PLAN_STORES 32u
 #define MAX_RECIPE_BYTES 640u
 #define MAX_SNAPSHOT_MEMORY_BYTES 65536u
 #define PLAN_REGISTER_SIZE 16u
@@ -108,32 +107,18 @@ typedef struct {
 } SnapshotMemoryPlan;
 
 typedef struct {
-    uint16_t size;
-    uint16_t address_recipe_size;
-    uint16_t value_recipe_size;
-    uint8_t address_recipe[MAX_RECIPE_BYTES];
-    uint8_t value_recipe[MAX_RECIPE_BYTES];
-} SnapshotForwardStore;
-
-typedef struct {
     uint64_t pc;
     uint64_t generation;
     uint64_t occurrences;
     uint32_t register_count;
     uint32_t memory_count;
-    uint32_t store_count;
     char registers[MAX_PLAN_REGISTERS][PLAN_REGISTER_SIZE];
     SnapshotMemoryPlan memory[MAX_PLAN_MEMORY];
-    SnapshotForwardStore stores[MAX_PLAN_STORES];
 } SnapshotPlan;
 
 typedef struct {
     SnapshotPlan *plan;
     uint8_t (*register_values)[SNAPSHOT_VALUE_SIZE + 8];
-    uint64_t store_addresses[MAX_PLAN_STORES];
-    uint8_t store_values[MAX_PLAN_STORES][8];
-    uint8_t store_sizes[MAX_PLAN_STORES];
-    uint32_t applied_stores;
 } RecipeCapture;
 
 static int socket_fd = -1;
@@ -542,14 +527,12 @@ static void install_snapshot_plan(const uint8_t *command)
     uint64_t pc = get_u64_le(command + 8);
     uint64_t generation = get_u64_le(command + 16);
     uint32_t count = get_u32_le(command + 24);
-    uint32_t packed_counts = get_u32_le(command + 28);
-    uint32_t memory_count = packed_counts & 0xffff;
-    uint32_t store_count = packed_counts >> 16;
+    uint32_t memory_count = get_u32_le(command + 28);
     uint8_t acknowledgement[PLAN_ACK_SIZE] = {0};
 
     if (!online_blocks || !at_tb_boundary || pc != boundary_pc || generation == 0 ||
         count > MAX_PLAN_REGISTERS || memory_count > MAX_PLAN_MEMORY ||
-        store_count > MAX_PLAN_STORES || count + memory_count == 0) {
+        count + memory_count == 0) {
         protocol_failure("invalid snapshot plan identity or bounds");
     }
     SnapshotPlan *old = g_hash_table_lookup(snapshot_plans, &pc);
@@ -563,7 +546,6 @@ static void install_snapshot_plan(const uint8_t *command)
     plan->generation = generation;
     plan->register_count = count;
     plan->memory_count = memory_count;
-    plan->store_count = store_count;
     for (uint32_t index = 0; index < count; index++) {
         if (!read_full(socket_fd, plan->registers[index], PLAN_REGISTER_SIZE) ||
             memchr(plan->registers[index], '\0', PLAN_REGISTER_SIZE) == NULL ||
@@ -601,33 +583,12 @@ static void install_snapshot_plan(const uint8_t *command)
         }
         total_memory += memory->size;
     }
-    for (uint32_t index = 0; index < store_count; index++) {
-        uint8_t descriptor[8];
-        if (!read_full(socket_fd, descriptor, sizeof(descriptor))) {
-            g_free(plan);
-            protocol_failure("truncated forwarding-store descriptor");
-        }
-        SnapshotForwardStore *store = &plan->stores[index];
-        store->size = (uint16_t)(descriptor[0] | descriptor[1] << 8);
-        store->address_recipe_size = (uint16_t)(descriptor[2] | descriptor[3] << 8);
-        store->value_recipe_size = (uint16_t)(descriptor[4] | descriptor[5] << 8);
-        if (descriptor[6] || descriptor[7] || store->size == 0 || store->size > 8 ||
-            store->address_recipe_size == 0 ||
-            store->address_recipe_size > MAX_RECIPE_BYTES ||
-            store->value_recipe_size == 0 ||
-            store->value_recipe_size > MAX_RECIPE_BYTES ||
-            !read_full(socket_fd, store->address_recipe, store->address_recipe_size) ||
-            !read_full(socket_fd, store->value_recipe, store->value_recipe_size)) {
-            g_free(plan);
-            protocol_failure("invalid forwarding-store descriptor");
-        }
-    }
     g_hash_table_replace(snapshot_plans, &plan->pc, plan);
     acknowledgement[0] = RESPONSE_OK;
     put_u64_le(acknowledgement + 8, pc);
     put_u64_le(acknowledgement + 16, generation);
     put_u32_le(acknowledgement + 24, count);
-    put_u32_le(acknowledgement + 28, memory_count | store_count << 16);
+    put_u32_le(acknowledgement + 28, memory_count);
     if (!write_full(socket_fd, acknowledgement, sizeof(acknowledgement))) {
         protocol_failure("unable to acknowledge snapshot plan");
     }
@@ -658,31 +619,14 @@ static bool recipe_read_register(void *opaque, uint8_t index,
 static bool recipe_read_memory(void *opaque, uint64_t address,
                                uint8_t *bytes, size_t size)
 {
-    RecipeCapture *capture = opaque;
-    if (size == 0 || size > 8) {
+    g_autoptr(GByteArray) value = g_byte_array_new();
+    (void)opaque;
+    if (size == 0 || size > 8 ||
+        !qemu_plugin_read_memory_vaddr(address, value, size) ||
+        value->len != size) {
         return false;
     }
-    for (size_t offset = 0; offset < size; offset++) {
-        bool forwarded = false;
-        for (uint32_t index = capture->applied_stores; index > 0; index--) {
-            uint32_t store = index - 1;
-            uint64_t start = capture->store_addresses[store];
-            if (address + offset >= start &&
-                address + offset - start < capture->store_sizes[store]) {
-                bytes[offset] = capture->store_values[store][address + offset - start];
-                forwarded = true;
-                break;
-            }
-        }
-        if (!forwarded) {
-            g_autoptr(GByteArray) value = g_byte_array_new();
-            if (!qemu_plugin_read_memory_vaddr(address + offset, value, 1) ||
-                value->len != 1) {
-                return false;
-            }
-            bytes[offset] = value->data[0];
-        }
-    }
+    memcpy(bytes, value->data, size);
     return true;
 }
 
@@ -726,32 +670,6 @@ static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command
     FocacciaRecipeContext context = {
         recipe_read_register, recipe_read_memory, &capture
     };
-    for (uint32_t index = 0; index < plan->store_count; index++) {
-        SnapshotForwardStore *store = &plan->stores[index];
-        FocacciaRecipeValue address, value;
-        if (!focaccia_recipe_eval(store->address_recipe,
-                                  store->address_recipe_size, &context, &address) ||
-            !focaccia_recipe_eval(store->value_recipe,
-                                  store->value_recipe_size, &context, &value) ||
-            address.width != 64 || value.width != store->size * 8) {
-            header[0] = RESPONSE_UNAVAILABLE;
-            put_u64_le(header + 8, pc);
-            put_u64_le(header + 16, generation);
-            put_u64_le(header + 24, plan->occurrences);
-            if (!write_full(socket_fd, header, sizeof(header))) {
-                protocol_failure("unable to send unavailable forwarding snapshot");
-            }
-            return;
-        }
-        capture.store_addresses[index] = address.bits;
-        capture.store_sizes[index] = store->size;
-        for (uint16_t byte = 0; byte < store->size; byte++) {
-            uint16_t target = target_endianness == TARGET_BIG_ENDIAN ?
-                store->size - byte - 1 : byte;
-            capture.store_values[index][target] = value.bits >> (byte * 8);
-        }
-        capture.applied_stores++;
-    }
     for (uint32_t index = 0; index < plan->memory_count; index++) {
         SnapshotMemoryPlan *memory = &plan->memory[index];
         FocacciaRecipeValue address;
