@@ -59,9 +59,10 @@
           postInstall = (old.postInstall or "") + ''
             mkdir -p $out/lib/plugins/
             cc -fPIC -shared \
-              ${./contrib/plugins/focaccia.c} \
-              ${./contrib/plugins/focaccia-plan.c} \
+              ${./contrib/plugins}/focaccia.c \
+              ${./contrib/plugins}/focaccia-plan.c \
               -o $out/lib/plugins/libfocaccia.so \
+              -I${./contrib/plugins} \
               -I$out/include/ \
               $(pkg-config --cflags glib-2.0) \
               $(pkg-config --libs glib-2.0)

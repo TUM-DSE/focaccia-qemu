@@ -22,6 +22,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define ACK_SIZE 16u
 #define MAX_REGISTER_BYTES 64u
 #define IDENTITY_DIGEST_SIZE 32u
+#define MAX_SNAPSHOT_PLANS 4096u
+#define MAX_PLAN_REGISTERS 32u
+#define PLAN_REGISTER_SIZE 16u
+#define PLAN_ACK_SIZE 32u
+#define SNAPSHOT_HEADER_SIZE 40u
+#define SNAPSHOT_VALUE_SIZE 64u
 
 #define CAP_PC (1ull << 0)
 #define CAP_INTEGER (1ull << 1)
@@ -29,6 +35,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define CAP_VECTOR (1ull << 3)
 #define CAP_TLS (1ull << 4)
 #define CAP_AARCH64_SVC (1ull << 5)
+#define CAP_BOUNDARY_SNAPSHOTS (1ull << 6)
 #define REGISTER_NAME_SIZE 32u
 
 #define COMMAND_READ_REGISTER 1u
@@ -36,6 +43,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define COMMAND_STEP 3u
 #define COMMAND_FINISH 4u
 #define COMMAND_ABORT 5u
+#define COMMAND_INSTALL_PLAN 6u
+#define COMMAND_CAPTURE_PLAN 7u
 
 #define EVENT_CUTPOINT 1u
 #define EVENT_STORE 2u
@@ -86,6 +95,14 @@ typedef struct {
     uint64_t instruction_count;
 } TranslationBlockMetadata;
 
+typedef struct {
+    uint64_t pc;
+    uint64_t generation;
+    uint64_t occurrences;
+    uint32_t register_count;
+    char registers[MAX_PLAN_REGISTERS][PLAN_REGISTER_SIZE];
+} SnapshotPlan;
+
 static int socket_fd = -1;
 static char *socket_path;
 static char target_name[16];
@@ -109,6 +126,9 @@ static bool pending_svc;
 static uint64_t pending_svc_pc;
 static uint64_t online_tb_last_pc;
 static GArray *pending_stores;
+static GHashTable *snapshot_plans;
+static uint64_t boundary_pc;
+static bool at_tb_boundary;
 
 static GHashTable *registers;
 static struct qemu_plugin_scoreboard *scoreboard;
@@ -126,6 +146,15 @@ static void put_u64_le(uint8_t *destination, uint64_t value)
     for (size_t index = 0; index < 8; index++) {
         destination[index] = (uint8_t)(value >> (index * 8));
     }
+}
+
+static uint32_t get_u32_le(const uint8_t *source)
+{
+    uint32_t value = 0;
+    for (size_t index = 0; index < 4; index++) {
+        value |= (uint32_t)source[index] << (index * 8);
+    }
+    return value;
 }
 
 static uint64_t get_u64_le(const uint8_t *source)
@@ -384,7 +413,7 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
     if (g_hash_table_lookup(registers, pc_register) == NULL) {
         protocol_failure("program counter register is unavailable");
     }
-    capabilities = CAP_PC;
+    capabilities = CAP_PC | CAP_BOUNDARY_SNAPSHOTS;
     if (strcmp(target_name, "x86_64") == 0) {
         if (g_hash_table_lookup(registers, "rax") != NULL) capabilities |= CAP_INTEGER;
         if (g_hash_table_lookup(registers, "eflags") != NULL) capabilities |= CAP_STATUS;
@@ -475,6 +504,102 @@ static void send_memory(const uint8_t *command)
     }
 }
 
+static void install_snapshot_plan(const uint8_t *command)
+{
+    uint64_t pc = get_u64_le(command + 8);
+    uint64_t generation = get_u64_le(command + 16);
+    uint32_t count = get_u32_le(command + 24);
+    uint8_t acknowledgement[PLAN_ACK_SIZE] = {0};
+
+    if (!online_blocks || !at_tb_boundary || pc != boundary_pc || generation == 0 ||
+        count == 0 || count > MAX_PLAN_REGISTERS) {
+        protocol_failure("invalid snapshot plan identity or bounds");
+    }
+    SnapshotPlan *old = g_hash_table_lookup(snapshot_plans, &pc);
+    if ((old == NULL && g_hash_table_size(snapshot_plans) >= MAX_SNAPSHOT_PLANS) ||
+        (old != NULL && generation <= old->generation)) {
+        protocol_failure("stale or overflowing snapshot plan installation");
+    }
+
+    SnapshotPlan *plan = g_new0(SnapshotPlan, 1);
+    plan->pc = pc;
+    plan->generation = generation;
+    plan->register_count = count;
+    for (uint32_t index = 0; index < count; index++) {
+        if (!read_full(socket_fd, plan->registers[index], PLAN_REGISTER_SIZE) ||
+            memchr(plan->registers[index], '\0', PLAN_REGISTER_SIZE) == NULL ||
+            plan->registers[index][0] == '\0' ||
+            g_hash_table_lookup(registers, plan->registers[index]) == NULL) {
+            g_free(plan);
+            protocol_failure("invalid snapshot plan register");
+        }
+        for (uint32_t previous = 0; previous < index; previous++) {
+            if (strcmp(plan->registers[index], plan->registers[previous]) == 0) {
+                g_free(plan);
+                protocol_failure("duplicate snapshot plan register");
+            }
+        }
+    }
+    g_hash_table_replace(snapshot_plans, &plan->pc, plan);
+    acknowledgement[0] = RESPONSE_OK;
+    put_u64_le(acknowledgement + 8, pc);
+    put_u64_le(acknowledgement + 16, generation);
+    put_u32_le(acknowledgement + 24, count);
+    if (!write_full(socket_fd, acknowledgement, sizeof(acknowledgement))) {
+        protocol_failure("unable to acknowledge snapshot plan");
+    }
+}
+
+static void capture_snapshot_plan(unsigned int cpu_index, const uint8_t *command)
+{
+    uint64_t pc = get_u64_le(command + 8);
+    uint64_t generation = get_u64_le(command + 16);
+    SnapshotPlan *plan = g_hash_table_lookup(snapshot_plans, &pc);
+    uint8_t header[SNAPSHOT_HEADER_SIZE] = {0};
+    uint8_t values[MAX_PLAN_REGISTERS][SNAPSHOT_VALUE_SIZE + 8] = {{0}};
+
+    if (!online_blocks || !at_tb_boundary || pc != boundary_pc || plan == NULL ||
+        plan->generation != generation) {
+        protocol_failure("snapshot capture does not match current boundary plan");
+    }
+    for (uint32_t index = 0; index < plan->register_count; index++) {
+        const char *name = plan->registers[index];
+        if (strcmp(name, pc_register) == 0) {
+            values[index][0] = 8;
+            put_target_u64(values[index] + 8, boundary_pc);
+        } else {
+            struct qemu_plugin_register *handle = g_hash_table_lookup(registers, name);
+            g_autoptr(GByteArray) value = g_byte_array_new();
+            int size = handle == NULL ? -1 : qemu_plugin_read_register(handle, value);
+            if (size <= 0 || size > MAX_REGISTER_BYTES || value->len != (guint)size) {
+                header[0] = RESPONSE_UNAVAILABLE;
+                put_u64_le(header + 8, pc);
+                put_u64_le(header + 16, generation);
+                put_u64_le(header + 24, plan->occurrences);
+                if (!write_full(socket_fd, header, sizeof(header))) {
+                    protocol_failure("unable to send unavailable snapshot");
+                }
+                return;
+            }
+            values[index][0] = (uint8_t)size;
+            memcpy(values[index] + 8, value->data, size);
+        }
+    }
+    plan->occurrences++;
+    header[0] = RESPONSE_OK;
+    put_u32_le(header + 4, plan->register_count);
+    put_u64_le(header + 8, pc);
+    put_u64_le(header + 16, generation);
+    put_u64_le(header + 24, plan->occurrences);
+    put_u64_le(header + 32, event_sequence);
+    if (!write_full(socket_fd, header, sizeof(header)) ||
+        !write_full(socket_fd, values,
+                    plan->register_count * (SNAPSHOT_VALUE_SIZE + 8))) {
+        protocol_failure("unable to send boundary snapshot");
+    }
+    (void)cpu_index;
+}
+
 static bool reserved_command_bytes_are_zero(const uint8_t *command)
 {
     for (size_t index = 1; index < 8; index++) {
@@ -503,7 +628,14 @@ static void command_loop(unsigned int cpu_index)
         case COMMAND_READ_MEMORY:
             send_memory(command);
             break;
+        case COMMAND_INSTALL_PLAN:
+            install_snapshot_plan(command);
+            break;
+        case COMMAND_CAPTURE_PLAN:
+            capture_snapshot_plan(cpu_index, command);
+            break;
         case COMMAND_STEP:
+            at_tb_boundary = false;
             return;
         case COMMAND_FINISH:
             if (!write_full(socket_fd, finish_ack, sizeof(finish_ack))) {
@@ -577,6 +709,8 @@ static void execute_translation_block(unsigned int cpu_index, void *userdata)
     if (finished) return;
 
     online_tb_last_pc = metadata->last_pc;
+    boundary_pc = metadata->first_pc;
+    at_tb_boundary = true;
     send_event(cpu_index, EVENT_TRANSLATION_BLOCK, metadata->first_pc,
                metadata->last_pc, metadata->instruction_count, 0, NULL);
 }
@@ -759,6 +893,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         g_hash_table_destroy(registers);
         registers = NULL;
     }
+    if (snapshot_plans != NULL) {
+        g_hash_table_destroy(snapshot_plans);
+        snapshot_plans = NULL;
+    }
     if (pending_stores != NULL) {
         g_array_free(pending_stores, true);
         pending_stores = NULL;
@@ -790,6 +928,7 @@ int qemu_plugin_install(
 
     registers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     pending_stores = g_array_new(false, false, sizeof(PendingStore));
+    snapshot_plans = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
     scoreboard = qemu_plugin_scoreboard_new(sizeof(FocacciaScoreboard));
     instruction_address = qemu_plugin_scoreboard_u64_in_struct(
         scoreboard,
