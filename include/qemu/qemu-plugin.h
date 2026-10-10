@@ -916,6 +916,20 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr,
                                    GByteArray *data, size_t len);
 
 /**
+ * qemu_plugin_memory_permissions_vaddr() - user-mode guest mapping evidence
+ * @addr: first guest virtual byte
+ * @len: bounded range length (1..65536)
+ *
+ * Returns permissions common to every guest page: bit 0 read, bit 1 write,
+ * bit 2 execute, bit 3 mapped. Unmapped ranges return zero. UINT32_MAX means
+ * unavailable/invalid (including system emulation). Write permission reflects
+ * the guest mapping, not temporary TCG code-page write protection. Call at a
+ * paused vCPU boundary; later concurrent mapping changes are not covered.
+ */
+QEMU_PLUGIN_API
+uint32_t qemu_plugin_memory_permissions_vaddr(uint64_t addr, size_t len);
+
+/**
  * qemu_plugin_read_register() - read register for current vCPU
  *
  * @handle: a @qemu_plugin_reg_handle handle

@@ -18,6 +18,12 @@
 #include "qemu/plugin-memory.h"
 #include "qemu/plugin.h"
 
+/* User-mode mapping evidence has no equivalent without a system MMU context. */
+uint32_t qemu_plugin_memory_permissions_vaddr(uint64_t addr, size_t len)
+{
+    return UINT32_MAX;
+}
+
 /*
  * In system mode we cannot trace the binary being executed so the
  * helpers all return NULL/0.

@@ -157,7 +157,16 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
         case IDX_IP_REG:
             return gdb_get_reg(env, mem_buf, env->eip);
         case IDX_FLAGS_REG:
-            return gdb_get_reg32(mem_buf, env->eflags);
+            /* Plugins use this getter while TCG is still executing. Decode
+             * the live lazy flags without changing the emulated CPU state.
+             * Outside cpu_exec keep the debugger's materialized register,
+             * including debugger-written values, as the authoritative value. */
+            /* Atomic-step exception cleanup can bypass cpu_exec_exit, but
+             * always clears CPUState.running. Never reuse a live-format hint
+             * for a stopped debugger read on that path. */
+            return gdb_get_reg32(mem_buf,
+                                cpu->tcg_flags_live && qatomic_read(&cs->running)
+                                ? cpu_compute_eflags(env) : env->eflags);
 
         case IDX_SEG_REGS:
             return gdb_get_reg32(mem_buf, env->segs[R_CS].selector);

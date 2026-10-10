@@ -2304,6 +2304,10 @@ struct ArchCPU {
     int32_t hv_max_vps;
 
     bool xen_vapic;
+
+    /* Host-only observation bookkeeping. Keep outside CPUX86State so the
+     * architectural state layout and TCG global offsets do not change. */
+    bool tcg_flags_live;
 };
 
 typedef struct X86CPUModel X86CPUModel;

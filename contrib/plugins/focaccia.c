@@ -41,6 +41,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define CAP_TLS (1ull << 4)
 #define CAP_AARCH64_SVC (1ull << 5)
 #define CAP_BOUNDARY_SNAPSHOTS (1ull << 6)
+#define CAP_MEMORY_PERMISSIONS (1ull << 7)
+#define CAP_STORE_FOOTPRINT (1ull << 8)
+#define MAX_STORE_FOOTPRINT 65536u
 #define REGISTER_NAME_SIZE 32u
 
 #define COMMAND_READ_REGISTER 1u
@@ -50,6 +53,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define COMMAND_ABORT 5u
 #define COMMAND_INSTALL_PLAN 6u
 #define COMMAND_CAPTURE_PLAN 7u
+#define COMMAND_MEMORY_PERMISSIONS 8u
+#define COMMAND_DRAIN_STORE_FOOTPRINT 9u
 
 #define EVENT_CUTPOINT 1u
 #define EVENT_STORE 2u
@@ -133,6 +138,12 @@ static uint64_t start_address;
 static uint64_t stop_address = UINT64_MAX;
 static bool coarse_cutpoints;
 static bool online_blocks;
+static bool online_store_footprint;
+typedef struct { uint64_t address, size; } StoreSpan;
+static StoreSpan store_footprint[MAX_STORE_FOOTPRINT];
+static uint32_t store_footprint_count;
+static uint64_t footprint_from_sequence, footprint_from_epoch;
+static bool footprint_drained;
 static bool automatic_snapshots = true;
 static GArray *explicit_cutpoints;
 static bool initialized;
@@ -328,6 +339,8 @@ static bool parse_options(int argc, char **argv)
             coarse_cutpoints = true;
         } else if (strcmp(option, "online-blocks=on") == 0) {
             online_blocks = true;
+        } else if (strcmp(option, "online-store-footprint=on") == 0) {
+            online_store_footprint = true;
         } else if (strcmp(option, "automatic-snapshots=off") == 0) {
             automatic_snapshots = false;
         } else if (g_str_has_prefix(option, "cutpoint=")) {
@@ -354,6 +367,11 @@ static bool parse_options(int argc, char **argv)
         }
     }
 
+    if (online_store_footprint) {
+        if (!online_blocks) return false;
+        /* Every footprint must be drained while its terminating event is paused. */
+        automatic_snapshots = false;
+    }
     if (start_address > stop_address ||
         !identity_present[0] || !identity_present[1] ||
         !identity_present[2] || !identity_present[3] ||
@@ -436,7 +454,8 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
     if (g_hash_table_lookup(registers, pc_register) == NULL) {
         protocol_failure("program counter register is unavailable");
     }
-    capabilities = CAP_PC | CAP_BOUNDARY_SNAPSHOTS;
+    capabilities = CAP_PC | CAP_BOUNDARY_SNAPSHOTS | CAP_MEMORY_PERMISSIONS;
+    if (online_store_footprint) capabilities |= CAP_STORE_FOOTPRINT;
     if (strcmp(target_name, "x86_64") == 0) {
         if (g_hash_table_lookup(registers, "rax") != NULL) capabilities |= CAP_INTEGER;
         if (g_hash_table_lookup(registers, "eflags") != NULL) capabilities |= CAP_STATUS;
@@ -464,13 +483,18 @@ static void send_register(unsigned int cpu_index, const uint8_t *command)
     }
 
     if (strcmp(requested, pc_register) == 0) {
-        response[0] = RESPONSE_OK;
-        response[1] = 8;
         memcpy(response + 8, pc_register, strlen(pc_register));
-        put_target_u64(
-            response + 40,
-            qemu_plugin_u64_get(instruction_address, cpu_index)
-        );
+        if (online_blocks && !at_tb_boundary) {
+            /* Online mode has no per-instruction scoreboard updates. At an
+             * action callback it must not advertise the initial/stale zero as
+             * an observed PC. Check successor PC at the resumed TB instead. */
+            response[0] = RESPONSE_UNAVAILABLE;
+        } else {
+            response[0] = RESPONSE_OK;
+            response[1] = 8;
+            put_target_u64(response + 40, online_blocks ? boundary_pc :
+                qemu_plugin_u64_get(instruction_address, cpu_index));
+        }
     } else {
         struct qemu_plugin_register *handle = g_hash_table_lookup(registers, requested);
         if (handle == NULL) {
@@ -524,6 +548,25 @@ static void send_memory(const uint8_t *command)
 
     if (!write_full(socket_fd, response, sizeof(response))) {
         protocol_failure("unable to send unavailable-memory response");
+    }
+}
+
+static void send_memory_permissions(const uint8_t *command)
+{
+    uint8_t response[MEMORY_RESPONSE_SIZE] = {0};
+    uint64_t address = get_u64_le(command + 8);
+    uint64_t size = get_u64_le(command + 16);
+    uint32_t flags = UINT32_MAX;
+    if (size > 0 && size <= MAX_SNAPSHOT_MEMORY_BYTES &&
+        address <= UINT64_MAX - (size - 1)) {
+        flags = qemu_plugin_memory_permissions_vaddr(address, size);
+    }
+    response[0] = flags == UINT32_MAX ? RESPONSE_UNAVAILABLE : RESPONSE_OK;
+    response[1] = flags == UINT32_MAX ? 0 : flags;
+    put_u64_le(response + 8, address);
+    put_u64_le(response + 16, size);
+    if (!write_full(socket_fd, response, sizeof(response))) {
+        protocol_failure("unable to send guest memory permissions");
     }
 }
 
@@ -728,6 +771,37 @@ static bool reserved_command_bytes_are_zero(const uint8_t *command)
     return true;
 }
 
+static void drain_store_footprint(const uint8_t *command)
+{
+    uint8_t header[48] = { 'F', 'O', 'C', 'S', 'T', 'O', 'R', 0 };
+    if (!online_store_footprint || footprint_drained ||
+        get_u64_le(command + 8) != event_sequence ||
+        get_u64_le(command + 16) != event_epoch ||
+        get_u64_le(command + 24) != 0) {
+        protocol_failure("invalid or duplicate store-footprint drain");
+    }
+    put_u32_le(header + 12, store_footprint_count);
+    put_u64_le(header + 16, footprint_from_sequence);
+    put_u64_le(header + 24, footprint_from_epoch);
+    put_u64_le(header + 32, event_sequence);
+    put_u64_le(header + 40, event_epoch);
+    if (!write_full(socket_fd, header, sizeof(header))) {
+        protocol_failure("unable to send store-footprint header");
+    }
+    for (uint32_t i = 0; i < store_footprint_count; i++) {
+        uint8_t span[16];
+        put_u64_le(span, store_footprint[i].address);
+        put_u64_le(span + 8, store_footprint[i].size);
+        if (!write_full(socket_fd, span, sizeof(span))) {
+            protocol_failure("unable to send store footprint");
+        }
+    }
+    store_footprint_count = 0;
+    footprint_from_sequence = event_sequence;
+    footprint_from_epoch = event_epoch;
+    footprint_drained = true;
+}
+
 static void command_loop(unsigned int cpu_index)
 {
     uint8_t command[COMMAND_SIZE];
@@ -746,13 +820,22 @@ static void command_loop(unsigned int cpu_index)
         case COMMAND_READ_MEMORY:
             send_memory(command);
             break;
+        case COMMAND_MEMORY_PERMISSIONS:
+            send_memory_permissions(command);
+            break;
         case COMMAND_INSTALL_PLAN:
             install_snapshot_plan(command);
             break;
         case COMMAND_CAPTURE_PLAN:
             (void)capture_snapshot_plan(cpu_index, command);
             break;
+        case COMMAND_DRAIN_STORE_FOOTPRINT:
+            drain_store_footprint(command);
+            break;
         case COMMAND_STEP:
+            if (online_store_footprint && !footprint_drained) {
+                protocol_failure("advance without draining store footprint");
+            }
             at_tb_boundary = false;
             return;
         case COMMAND_FINISH:
@@ -779,6 +862,7 @@ static void send_event_wait(unsigned int cpu_index, uint8_t kind, uint64_t pc,
                        const uint8_t value[16], bool automatic)
 {
     uint8_t event[EVENT_SIZE] = {0};
+    footprint_drained = false;
     event[0] = kind;
     event[1] = automatic;
     put_u64_le(event + 8, ++event_sequence);
@@ -921,6 +1005,29 @@ static void syscall_return(qemu_plugin_id_t id, unsigned int cpu_index,
     pending_svc = false;
 }
 
+/* Passive address/size evidence only. NO_REGS maps to TCG_CALL_NO_RWG:
+ * this callback neither reads nor writes guest CPU globals. No register/value
+ * observation, instruction execution callback, allocation, or socket stop is
+ * introduced at individual stores. Stores from translated helper paths are
+ * also delivered by QEMU's memory callback API. */
+static void record_store_footprint(unsigned int cpu_index,
+                                   qemu_plugin_meminfo_t info,
+                                   uint64_t address, void *userdata)
+{
+    unsigned int shift = qemu_plugin_mem_size_shift(info);
+    (void)userdata;
+    if (finished) return;
+    if (cpu_index != 0 || event_sequence == 0 || shift > 4 ||
+        store_footprint_count == MAX_STORE_FOOTPRINT) {
+        protocol_failure("invalid or overflowing store footprint");
+    }
+    uint64_t size = 1ull << shift;
+    if (address > UINT64_MAX - (size - 1)) {
+        protocol_failure("wrapping store footprint");
+    }
+    store_footprint[store_footprint_count++] = (StoreSpan){ address, size };
+}
+
 static void record_store(unsigned int cpu_index, qemu_plugin_meminfo_t info,
                          uint64_t vaddr, void *userdata)
 {
@@ -967,24 +1074,35 @@ static void instrument_translation_block(
         }
         TranslationBlockMetadata *block = g_new0(TranslationBlockMetadata, 1);
         block->instruction_count = instruction_count;
+        uint64_t expected_address = 0;
         for (size_t index = 0; index < instruction_count; index++) {
             uint64_t address = qemu_plugin_insn_vaddr(
                 qemu_plugin_tb_get_insn(translation_block, index)
             );
-            if ((index != 0 && address != block->last_pc + 4) ||
+            uint64_t instruction_size = qemu_plugin_insn_size(
+                qemu_plugin_tb_get_insn(translation_block, index)
+            );
+            if ((index != 0 && address != expected_address) || instruction_size == 0 ||
                 address < start_address || address > stop_address) {
                 protocol_failure("online block is not contiguous in the declared image");
             }
             if (index == 0) block->first_pc = address;
             block->last_pc = address;
+            expected_address = address + instruction_size;
+            if (online_store_footprint) {
+                qemu_plugin_register_vcpu_mem_cb(
+                    qemu_plugin_tb_get_insn(translation_block, index),
+                    record_store_footprint, QEMU_PLUGIN_CB_NO_REGS,
+                    QEMU_PLUGIN_MEM_W, NULL);
+            }
         }
         qemu_plugin_register_vcpu_tb_exec_cb(
             translation_block, execute_translation_block,
             QEMU_PLUGIN_CB_R_REGS, block
         );
-        /* Online validation must leave the translated guest block intact.  In
-         * particular, no instruction inline op, execution callback, or memory
-         * callback may become a TCG optimizer barrier. */
+        /* No instruction execution callbacks or inline register observations.
+         * The opt-in passive memory callback has NO_RWG, unlike register-reading
+         * callbacks that synchronize globals and inhibit cross-insn folding. */
         return;
     }
     for (size_t index = 0; index < instruction_count; index++) {

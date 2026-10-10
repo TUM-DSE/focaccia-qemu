@@ -31,6 +31,7 @@
 #include "exec/page-protection.h"
 #include "exec/helper-proto.h"
 #include "qemu/atomic128.h"
+#include "qemu/qemu-plugin.h"
 #include "qemu/bswap.h"
 #include "qemu/int128.h"
 #include "trace.h"
@@ -218,6 +219,51 @@ void page_dump(FILE *f)
     fprintf(f, "%-*s %-*s %-*s %s\n",
             length, "start", length, "end", length, "size", "prot");
     walk_memory_regions(f, dump_region);
+}
+
+uint32_t qemu_plugin_memory_permissions_vaddr(uint64_t addr, size_t len)
+{
+    uint32_t result = 15;
+    bool locked = have_mmap_lock();
+    uint64_t last;
+
+    g_assert(current_cpu);
+    if (len == 0 || len > 65536 || addr > UINT64_MAX - (len - 1)) {
+        return UINT32_MAX;
+    }
+    last = addr + len - 1;
+    if ((target_ulong)addr != addr || (target_ulong)last != last) {
+        return UINT32_MAX;
+    }
+    if (!locked) {
+        mmap_lock();
+    }
+    for (uint64_t cursor = addr;;) {
+        int flags = page_get_flags((target_ulong)cursor);
+        uint32_t permissions = 0;
+        if (flags & PAGE_VALID) {
+            permissions = 8;
+            if (flags & PAGE_READ) {
+                permissions |= 1;
+            }
+            if (flags & PAGE_WRITE_ORG) {
+                permissions |= 2;
+            }
+            if (flags & PAGE_EXEC) {
+                permissions |= 4;
+            }
+        }
+        result &= permissions;
+        uint64_t page_last = cursor | (TARGET_PAGE_SIZE - 1);
+        if (page_last >= last) {
+            break;
+        }
+        cursor = page_last + 1;
+    }
+    if (!locked) {
+        mmap_unlock();
+    }
+    return result;
 }
 
 int page_get_flags(target_ulong address)
