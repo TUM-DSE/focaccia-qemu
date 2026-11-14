@@ -414,6 +414,30 @@ bool plugin_gen_tb_start(CPUState *cpu, const DisasContextBase *db)
     return true;
 }
 
+void plugin_gen_dmb_translation(uint32_t domain, uint32_t types, uint32_t word)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    if (insn) {
+        insn->dmb_present = true;
+        insn->dmb_domain = domain;
+        insn->dmb_types = types;
+        insn->dmb_word = word;
+    }
+}
+
+void plugin_gen_dmb_emission(uint32_t bar, uint32_t cflags, bool emitted)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    if (insn && insn->dmb_present) {
+        /* Multiple mb emissions are not the audited trans_DSB_DMB shape. */
+        assert(!insn->dmb_emission_observed);
+        insn->dmb_emission_observed = true;
+        insn->dmb_bar = bar;
+        insn->dmb_cflags = cflags;
+        insn->dmb_emitted = emitted;
+    }
+}
+
 void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
 {
     struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
@@ -434,6 +458,8 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     tcg_ctx->plugin_insn = insn;
     insn->calls_helpers = false;
     insn->mem_helper = false;
+    insn->dmb_present = false;
+    insn->dmb_emission_observed = false;
     if (insn->insn_cbs) {
         g_array_set_size(insn->insn_cbs, 0);
     }

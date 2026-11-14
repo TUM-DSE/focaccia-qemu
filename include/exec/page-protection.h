@@ -27,6 +27,11 @@
 #define PAGE_RESET     0x0040
 /* For linux-user, indicates that the page is MAP_ANON. */
 #define PAGE_ANON      0x0080
+/* Observer provenance from successful guest mmap MAP_TYPE, never PAGE_ANON. */
+#define PAGE_MAP_PRIVATE 0x0100
+#define PAGE_MAP_SHARED  0x1000
+/* Explicit synthetic x86-64 vsyscall execution service, never guest RAM. */
+#define PAGE_EXEC_SERVICE 0x2000
 
 /* Target-specific bits that will be used via page_get_flags().  */
 #define PAGE_TARGET_1  0x0200

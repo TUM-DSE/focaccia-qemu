@@ -930,6 +930,115 @@ QEMU_PLUGIN_API
 uint32_t qemu_plugin_memory_permissions_vaddr(uint64_t addr, size_t len);
 
 /**
+ * qemu_plugin_private_ram_snapshot() - complete bounded user guest RAM evidence
+ * @mappings: empty/output GArray of qemu_plugin_guest_mapping
+ * @memory: empty/output concatenated observer bytes (including PROT_NONE guards)
+ * @max_bytes: positive limit, at most 64 MiB
+ * @max_mappings: positive limit, at most 4096
+ * @generation: mapping-generation identity captured under mmap_lock
+ *
+ * Flags use 1/2/4/8 for guest R/W/X/mapped, 16 for proven MAP_PRIVATE,
+ * 32 for proven shared ownership. PAGE_ANON is not private evidence.
+ * All valid guest ranges must have proven private provenance; otherwise fail.
+ * Missing/unreadable observer bytes, unknown/shared ranges, invalidated
+ * provenance, overflow or budgets fail the entire capture, never truncate it.
+ * Linux only: an O_RDONLY|O_CLOEXEC proc-memory FD is verified as this process,
+ * then exact pread copies are bounded to revalidated private target pages and
+ * checked g2h translations. No guest/host protection changes are performed;
+ * protected guards retain their real guest permission bits in the inventory.
+ * Caller must quiesce all guest threads (the Focaccia producer enforces one
+ * vCPU) and use a paused user-mode CPU callback. No system-mode equivalent.
+ * Returns false with empty outputs/generation zero on unavailable evidence.
+ */
+typedef struct qemu_plugin_guest_mapping {
+    uint64_t start;
+    uint64_t size;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t data_offset;
+    uint64_t host_start; /* Certified g2h span; metadata-only external observer. */
+} qemu_plugin_guest_mapping;
+
+QEMU_PLUGIN_API
+bool qemu_plugin_private_ram_snapshot(GArray *mappings, GByteArray *memory,
+                                     uint64_t max_bytes, uint32_t max_mappings,
+                                     uint64_t *generation);
+
+/* Metadata only: never claims bytes captured. All private guest ranges and
+ * checked linear g2h host spans, under mmap_lock, with a generation identity.
+ * Consumer must hold the paused event and revalidate the certificate after
+ * its authorized owned-process external read before accepting any snapshot. */
+QEMU_PLUGIN_API
+bool qemu_plugin_private_ram_inventory(GArray *mappings, uint64_t max_bytes,
+                                      uint32_t max_mappings, uint64_t *generation);
+
+/* Atomic-only complete inventory: private RAM plus explicitly typed,
+ * non-readable x86 execution-service descriptors. Services consume mapping
+ * slots but no RAM-byte budget and never carry bytes or host spans. */
+QEMU_PLUGIN_API
+bool qemu_plugin_private_atomic_inventory(GArray *mappings, uint64_t max_bytes,
+                                          uint32_t max_mappings,
+                                          uint64_t *generation);
+
+/* Metadata-only AArch64 Linux-user BTI page certificate for a paused event. */
+typedef struct QemuPluginBtiPage QemuPluginBtiPage;
+struct QemuPluginBtiPage {
+    uint64_t page_start;
+    uint64_t generation;
+    uint32_t flags;
+    uint32_t features;
+};
+QEMU_PLUGIN_API
+bool qemu_plugin_observe_bti_page(uint64_t pc, QemuPluginBtiPage *result);
+
+/* Independent translation facts from trans_DSB_DMB -> tcg_gen_mb. The
+ * normal nonblocking instruction callback is separately required for execution.
+ * emitted means INDEX_op_mb was emitted, NOT hardware ordering validation. */
+typedef struct QemuPluginDmbTranslation {
+    uint32_t domain, types, word, cflags, bar;
+    uint32_t emitted;
+} QemuPluginDmbTranslation;
+QEMU_PLUGIN_API
+bool qemu_plugin_insn_dmb_translation(const struct qemu_plugin_insn *insn,
+                                      QemuPluginDmbTranslation *result);
+
+/* Source-boundary synchronous signal snapshots, version 1. Callback receives
+ * immutable copies; NO register API/global synchronization is required. */
+typedef struct QemuPluginAsyncSignalState {
+    uint32_t version, valid;
+    uint8_t cpu_le[824];
+    uint8_t delivery_inputs_le[176];
+    uint8_t logical_mask_le[8], sigint_action_le[32], sigpipe_action_le[32];
+} QemuPluginAsyncSignalState;
+typedef void (*qemu_plugin_async_signal_cb_t)(unsigned int cpu_index,
+    uint32_t stage, uint64_t frame_address, uint64_t frame_size,
+    int32_t signal, int32_t result, const QemuPluginAsyncSignalState *state,
+    void *userdata);
+/* One lifetime observer only; false on unsupported target or duplicate. */
+QEMU_PLUGIN_API
+bool qemu_plugin_register_async_signal_observer(qemu_plugin_id_t id,
+    qemu_plugin_async_signal_cb_t callback, void *userdata);
+
+/* Current paused Linux-user AArch64 guest signal state. The mask and action
+ * are exact target-little-endian ABI bytes; this never reports host signals. */
+typedef struct QemuPluginGuestLogicalSignalState {
+    uint8_t target_mask_le[8];
+    uint8_t sigpipe_action_le[32];
+} QemuPluginGuestLogicalSignalState;
+QEMU_PLUGIN_API
+bool qemu_plugin_guest_logical_signal_state(
+    QemuPluginGuestLogicalSignalState *result);
+
+typedef struct QemuPluginGuestLogicalSignalStateV2 {
+    uint8_t target_mask_le[8];
+    uint8_t sigint_action_le[32];
+    uint8_t sigpipe_action_le[32];
+} QemuPluginGuestLogicalSignalStateV2;
+QEMU_PLUGIN_API
+bool qemu_plugin_guest_logical_signal_state_v2(
+    QemuPluginGuestLogicalSignalStateV2 *result);
+
+/**
  * qemu_plugin_read_register() - read register for current vCPU
  *
  * @handle: a @qemu_plugin_reg_handle handle

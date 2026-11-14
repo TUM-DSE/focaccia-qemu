@@ -132,6 +132,69 @@ void host_to_target_sigset(target_sigset_t *d, const sigset_t *s)
         d->sig[i] = tswapal(d1.sig[i]);
 }
 
+bool qemu_linux_user_guest_logical_signal_state_v2(CPUState *cpu,
+                                                    uint8_t mask[8],
+                                                    uint8_t sigint_action[32],
+                                                    uint8_t sigpipe_action[32])
+{
+#if defined(TARGET_AARCH64) && !TARGET_BIG_ENDIAN
+    TaskState *ts;
+    target_sigset_t target_mask;
+    const struct target_sigaction *sigint, *sigpipe;
+    abi_ulong handler, flags, restorer;
+
+    QEMU_BUILD_BUG_ON(TARGET_ABI_BITS != 64);
+    QEMU_BUILD_BUG_ON(TARGET_NSIG != 64);
+    QEMU_BUILD_BUG_ON(TARGET_SIGINT != 2);
+    QEMU_BUILD_BUG_ON(TARGET_SIGPIPE != 13);
+    QEMU_BUILD_BUG_ON(sizeof(target_sigset_t) != sizeof(uint64_t));
+    QEMU_BUILD_BUG_ON(sizeof(struct target_sigaction) != 32);
+    QEMU_BUILD_BUG_ON(!TARGET_ARCH_HAS_SA_RESTORER);
+
+    if (!cpu || !mask || !sigint_action || !sigpipe_action) {
+        return false;
+    }
+    ts = get_task_state(cpu);
+    if (!ts) {
+        return false;
+    }
+    host_to_target_sigset(&target_mask, &ts->signal_mask);
+    memcpy(mask, &target_mask, sizeof(target_mask));
+
+    sigint = &sigact_table[TARGET_SIGINT - 1];
+    sigpipe = &sigact_table[TARGET_SIGPIPE - 1];
+#define COPY_TARGET_ACTION(destination, action) do { \
+        handler = tswapal((action)->_sa_handler); \
+        flags = tswapal((action)->sa_flags); \
+        restorer = tswapal((action)->sa_restorer); \
+        memcpy((destination), &handler, sizeof(handler)); \
+        memcpy((destination) + 8, &flags, sizeof(flags)); \
+        memcpy((destination) + 16, &restorer, sizeof(restorer)); \
+        /* sa_mask is stored raw from guest memory by do_sigaction(). */ \
+        memcpy((destination) + 24, &(action)->sa_mask, sizeof((action)->sa_mask)); \
+    } while (0)
+    COPY_TARGET_ACTION(sigint_action, sigint);
+    COPY_TARGET_ACTION(sigpipe_action, sigpipe);
+#undef COPY_TARGET_ACTION
+    return true;
+#else
+    (void)cpu;
+    (void)mask;
+    (void)sigint_action;
+    (void)sigpipe_action;
+    return false;
+#endif
+}
+
+bool qemu_linux_user_guest_logical_signal_state(CPUState *cpu,
+                                                 uint8_t mask[8],
+                                                 uint8_t sigpipe_action[32])
+{
+    uint8_t sigint_action[32];
+    return qemu_linux_user_guest_logical_signal_state_v2(
+        cpu, mask, sigint_action, sigpipe_action);
+}
+
 void target_to_host_sigset_internal(sigset_t *d,
                                     const target_sigset_t *s)
 {

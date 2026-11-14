@@ -261,6 +261,21 @@ size_t qemu_plugin_insn_data(const struct qemu_plugin_insn *insn,
     return translator_st(db, dest, insn->vaddr, len) ? len : 0;
 }
 
+bool qemu_plugin_insn_dmb_translation(const struct qemu_plugin_insn *insn,
+                                      QemuPluginDmbTranslation *result)
+{
+    if (!insn || !result || !insn->dmb_present ||
+        !insn->dmb_emission_observed) {
+        return false;
+    }
+    *result = (QemuPluginDmbTranslation) {
+        .domain = insn->dmb_domain, .types = insn->dmb_types,
+        .word = insn->dmb_word, .cflags = insn->dmb_cflags,
+        .bar = insn->dmb_bar, .emitted = insn->dmb_emitted,
+    };
+    return true;
+}
+
 size_t qemu_plugin_insn_size(const struct qemu_plugin_insn *insn)
 {
     return insn->len;

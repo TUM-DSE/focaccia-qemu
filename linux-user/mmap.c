@@ -562,6 +562,21 @@ static abi_long mmap_end(abi_ulong start, abi_ulong last,
     if (flags & MAP_ANONYMOUS) {
         page_flags |= PAGE_ANON;
     }
+    /* Target MAP_TYPE is authoritative provenance, independent of ANON and
+     * host passthrough/emulation choices. A replacement clears old ownership. */
+    switch (flags & MAP_TYPE) {
+    case MAP_PRIVATE:
+        page_flags |= PAGE_MAP_PRIVATE;
+        break;
+    case MAP_SHARED:
+#ifdef MAP_SHARED_VALIDATE
+    case MAP_SHARED_VALIDATE:
+#endif
+        page_flags |= PAGE_MAP_SHARED;
+        break;
+    default:
+        break; /* Unknown ownership never qualifies for a private snapshot. */
+    }
     page_flags |= PAGE_RESET;
     if (passthrough_start > passthrough_last) {
         page_set_flags(start, last, page_flags);
@@ -1105,7 +1120,8 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
                        abi_ulong new_size, unsigned long flags,
                        abi_ulong new_addr)
 {
-    int prot;
+    int prot, observation_owner;
+    bool observation_uniform;
     void *host_addr;
 
     if (!guest_range_valid_untagged(old_addr, old_size) ||
@@ -1118,6 +1134,9 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
     }
 
     mmap_lock();
+    observation_uniform = page_mapping_observation_uniform(old_addr, old_size);
+    observation_owner = observation_uniform ?
+        page_get_flags(old_addr) & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED) : 0;
 
     if (flags & MREMAP_FIXED) {
         host_addr = mremap(g2h_untagged(old_addr), old_size, new_size,
@@ -1184,6 +1203,13 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
     } else {
         new_addr = h2g(host_addr);
         prot = page_get_flags(old_addr);
+        prot = (prot & ~(PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)) | observation_owner;
+        /* Existing remap code collapses old permissions to its first page and
+         * clears the old range. Never certify an alias/unknown/heterogeneous
+         * successful remap as a complete ownership inventory. */
+        if (!observation_uniform || (flags & ~(MREMAP_MAYMOVE | MREMAP_FIXED))) {
+            page_mapping_observation_invalidate();
+        }
         page_set_flags(old_addr, old_addr + old_size - 1, 0);
         shm_region_rm_complete(old_addr, old_addr + old_size - 1);
         page_set_flags(new_addr, new_addr + new_size - 1,
@@ -1433,7 +1459,7 @@ abi_ulong target_shmat(CPUArchState *cpu_env, int shmid,
 
         last = shmaddr + m_len - 1;
         page_set_flags(shmaddr, last,
-                       PAGE_VALID | PAGE_RESET | PAGE_READ |
+                       PAGE_VALID | PAGE_RESET | PAGE_MAP_SHARED | PAGE_READ |
                        (shmflg & SHM_RDONLY ? 0 : PAGE_WRITE) |
                        (shmflg & SHM_EXEC ? PAGE_EXEC : 0));
 

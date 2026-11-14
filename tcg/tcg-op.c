@@ -329,6 +329,8 @@ void tcg_gen_mb(TCGBar mb_type)
     if (parallel) {
         tcg_gen_op1(INDEX_op_mb, 0, mb_type);
     }
+    /* Observe the actual branch above; never infer emission from thread count. */
+    plugin_gen_dmb_emission(mb_type, tcg_ctx->gen_tb->cflags, parallel);
 }
 
 void tcg_gen_plugin_cb(unsigned from)

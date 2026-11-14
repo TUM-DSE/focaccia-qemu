@@ -94,6 +94,14 @@ typedef int (*walk_memory_regions_fn)(void *, target_ulong,
 
 int walk_memory_regions(void *, walk_memory_regions_fn);
 
+/* Observation metadata only: called with mmap_lock, never alter mapping calls. */
+bool page_mapping_observation_uniform(target_ulong start, target_ulong len);
+void page_mapping_observation_invalidate(void);
+
+/* Actual Linux-user mapping BTI metadata; only available in AArch64 user mode. */
+struct QemuPluginBtiPage;
+bool page_mapping_observe_bti(target_ulong pc, struct QemuPluginBtiPage *result);
+
 void page_dump(FILE *f);
 
 #endif

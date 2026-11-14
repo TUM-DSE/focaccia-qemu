@@ -120,6 +120,12 @@ struct qemu_plugin_insn {
 
     /* if set, the instruction calls helpers that might access guest memory */
     bool mem_helper;
+
+    /* Source translation facts only; not execution or ordering evidence. */
+    bool dmb_present;
+    uint32_t dmb_domain, dmb_types, dmb_word;
+    uint32_t dmb_cflags, dmb_bar;
+    bool dmb_emission_observed, dmb_emitted;
 };
 
 /* A scoreboard is an array of values, indexed by vcpu_index */

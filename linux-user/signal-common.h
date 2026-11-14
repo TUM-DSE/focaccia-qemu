@@ -41,6 +41,11 @@ static inline void target_sigemptyset(target_sigset_t *set)
 
 void host_to_target_sigset_internal(target_sigset_t *d,
                                     const sigset_t *s);
+/* Copy the actual Linux-user guest task mask and SIGPIPE disposition without
+ * consulting host sigaction state. Buffers contain AArch64 target-LE bytes. */
+bool qemu_linux_user_guest_logical_signal_state(CPUState *cpu,
+                                                 uint8_t mask[8],
+                                                 uint8_t sigpipe_action[32]);
 void target_to_host_sigset_internal(sigset_t *d,
                                     const target_sigset_t *s);
 void set_sigmask(const sigset_t *set);

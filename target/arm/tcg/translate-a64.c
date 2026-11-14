@@ -25,6 +25,7 @@
 #include "arm_ldst.h"
 #include "semihosting/semihost.h"
 #include "cpregs.h"
+#include "exec/plugin-gen.h"
 
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_pc;
@@ -2140,6 +2141,7 @@ static bool trans_DSB_DMB(DisasContext *s, arg_DSB_DMB *a)
         bar = TCG_BAR_SC | TCG_MO_ALL;
         break;
     }
+    plugin_gen_dmb_translation(a->domain, a->types, s->insn);
     tcg_gen_mb(bar);
     return true;
 }

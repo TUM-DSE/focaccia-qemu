@@ -63,6 +63,7 @@
               ${./contrib/plugins}/focaccia-plan.c \
               -o $out/lib/plugins/libfocaccia.so \
               -I${./contrib/plugins} \
+              -I${./include}/qemu \
               -I$out/include/ \
               $(pkg-config --cflags glib-2.0) \
               $(pkg-config --libs glib-2.0)

@@ -18,10 +18,51 @@
 #include "qemu/plugin-memory.h"
 #include "qemu/plugin.h"
 
+bool qemu_plugin_register_async_signal_observer(qemu_plugin_id_t id,
+    qemu_plugin_async_signal_cb_t callback, void *userdata)
+{
+    (void)id; (void)callback; (void)userdata;
+    return false;
+}
+
 /* User-mode mapping evidence has no equivalent without a system MMU context. */
 uint32_t qemu_plugin_memory_permissions_vaddr(uint64_t addr, size_t len)
 {
     return UINT32_MAX;
+}
+
+bool qemu_plugin_observe_bti_page(uint64_t pc, QemuPluginBtiPage *result)
+{
+    (void)pc;
+    memset(result, 0, sizeof(*result));
+    return false;
+}
+
+bool qemu_plugin_private_ram_inventory(GArray *mappings, uint64_t max_bytes,
+                                      uint32_t max_mappings, uint64_t *generation)
+{
+    g_array_set_size(mappings, 0);
+    *generation = 0;
+    return false;
+}
+
+bool qemu_plugin_private_atomic_inventory(GArray *mappings, uint64_t max_bytes,
+                                          uint32_t max_mappings,
+                                          uint64_t *generation)
+{
+    g_array_set_size(mappings, 0);
+    *generation = 0;
+    return false;
+}
+
+bool qemu_plugin_private_ram_snapshot(GArray *mappings, GByteArray *memory,
+                                     uint64_t max_bytes, uint32_t max_mappings,
+                                     uint64_t *generation)
+{
+    g_array_set_size(mappings, 0);
+    g_byte_array_set_size(memory, 0);
+    *generation = 0;
+    return false;
 }
 
 /*

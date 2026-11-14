@@ -24,6 +24,8 @@ void plugin_gen_insn_start(CPUState *cpu, const struct DisasContextBase *db);
 void plugin_gen_insn_end(void);
 
 void plugin_gen_disable_mem_helpers(void);
+void plugin_gen_dmb_translation(uint32_t domain, uint32_t types, uint32_t word);
+void plugin_gen_dmb_emission(uint32_t bar, uint32_t cflags, bool emitted);
 
 #else /* !CONFIG_PLUGIN */
 
@@ -44,6 +46,12 @@ static inline void plugin_gen_tb_end(CPUState *cpu, size_t num_insns)
 { }
 
 static inline void plugin_gen_disable_mem_helpers(void)
+{ }
+static inline void plugin_gen_dmb_translation(uint32_t domain, uint32_t types,
+                                              uint32_t word)
+{ }
+static inline void plugin_gen_dmb_emission(uint32_t bar, uint32_t cflags,
+                                           bool emitted)
 { }
 
 #endif /* CONFIG_PLUGIN */

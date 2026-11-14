@@ -22,6 +22,91 @@
 #include "signal-common.h"
 #include "linux-user/trace.h"
 #include "target/arm/cpu-features.h"
+#include "qemu/private-signal-observer.h"
+
+static void qemu_private_signal_store_le32(uint8_t *p, uint32_t value)
+{
+    unsigned int i;
+
+    for (i = 0; i < 4; i++) {
+        p[i] = value >> (i * 8);
+    }
+}
+
+static void qemu_private_signal_store_le64(uint8_t *p, uint64_t value)
+{
+    unsigned int i;
+
+    for (i = 0; i < 8; i++) {
+        p[i] = value >> (i * 8);
+    }
+}
+
+static void qemu_private_signal_delivery_inputs(
+    QemuPrivateSignalDeliveryInputs *inputs,
+    const struct target_sigaction *ka, const target_siginfo_t *info,
+    const target_sigset_t *set)
+{
+    QEMU_BUILD_BUG_ON(sizeof(*ka) != 32);
+    QEMU_BUILD_BUG_ON(sizeof(ka->sa_mask) != 8);
+    QEMU_BUILD_BUG_ON(sizeof(*info) != 128);
+    QEMU_BUILD_BUG_ON(sizeof(set->sig[0]) != 8);
+
+    memset(inputs, 0, sizeof(*inputs));
+    qemu_private_signal_store_le64(inputs->action_handler_le,
+                                   ka->_sa_handler);
+    qemu_private_signal_store_le64(inputs->action_flags_le, ka->sa_flags);
+    qemu_private_signal_store_le64(inputs->action_restorer_le,
+                                   ka->sa_restorer);
+    qemu_private_signal_store_le64(inputs->action_mask_le,
+                                   ka->sa_mask.sig[0]);
+    qemu_private_signal_store_le64(inputs->saved_mask_le, set->sig[0]);
+    inputs->info_present = info != NULL;
+    if (info) {
+        memcpy(inputs->info, info, sizeof(inputs->info));
+    }
+}
+
+bool qemu_linux_user_signal_cpu_snapshot(const void *cpu_state,
+                                         uint8_t *wire, size_t size)
+{
+    const CPUARMState *env = cpu_state;
+    unsigned int i;
+
+    if (!env || !wire || size != QEMU_PRIVATE_SIGNAL_CPU_WIRE_SIZE) {
+        return false;
+    }
+
+    for (i = 0; i < QEMU_PRIVATE_SIGNAL_CPU_X_COUNT; i++) {
+        qemu_private_signal_store_le64(wire + QEMU_PRIVATE_SIGNAL_CPU_X_OFFSET
+                                       + i * sizeof(uint64_t), env->xregs[i]);
+    }
+    qemu_private_signal_store_le64(wire + QEMU_PRIVATE_SIGNAL_CPU_PC_OFFSET,
+                                   env->pc);
+    qemu_private_signal_store_le64(wire + QEMU_PRIVATE_SIGNAL_CPU_PSTATE_OFFSET,
+                                   pstate_read((CPUARMState *)env));
+    for (i = 0; i < QEMU_PRIVATE_SIGNAL_CPU_SIMD_COUNT; i++) {
+        uint64_t *q = aa64_vfp_qreg((CPUARMState *)env, i);
+        uint8_t *v = wire + QEMU_PRIVATE_SIGNAL_CPU_SIMD_OFFSET
+                     + i * QEMU_PRIVATE_SIGNAL_CPU_SIMD_STRIDE;
+
+        qemu_private_signal_store_le64(v, q[0]);
+        qemu_private_signal_store_le64(v + sizeof(uint64_t), q[1]);
+    }
+    qemu_private_signal_store_le32(wire + QEMU_PRIVATE_SIGNAL_CPU_FPCR_OFFSET,
+                                   vfp_get_fpcr((CPUARMState *)env));
+    qemu_private_signal_store_le32(wire + QEMU_PRIVATE_SIGNAL_CPU_FPSR_OFFSET,
+                                   vfp_get_fpsr((CPUARMState *)env));
+    qemu_private_signal_store_le64(wire + QEMU_PRIVATE_SIGNAL_CPU_BTYPE_OFFSET,
+                                   env->btype);
+    qemu_private_signal_store_le64(wire + QEMU_PRIVATE_SIGNAL_CPU_SVCR_OFFSET,
+                                   env->svcr);
+    qemu_private_signal_store_le64(wire + QEMU_PRIVATE_SIGNAL_CPU_TPIDR_EL0_OFFSET,
+                                   env->cp15.tpidr_el[0]);
+    qemu_private_signal_store_le64(wire + QEMU_PRIVATE_SIGNAL_CPU_FAULT_ADDRESS_OFFSET,
+                                   env->exception.vaddress);
+    return true;
+}
 
 struct target_sigcontext {
     uint64_t fault_address;
@@ -572,6 +657,7 @@ static void target_setup_frame(int usig, struct target_sigaction *ka,
     int sve_size = 0, za_size = 0;
     struct target_rt_sigframe *frame;
     struct target_rt_frame_record *fr;
+    QemuPrivateSignalDeliveryInputs inputs;
     abi_ulong frame_addr, return_addr;
 
     /* FPSIMD record is always in the standard space.  */
@@ -624,6 +710,10 @@ static void target_setup_frame(int usig, struct target_sigaction *ka,
 
     frame_addr = get_sigframe(ka, env, layout.total_size);
     trace_user_setup_frame(env, frame_addr);
+    qemu_private_signal_delivery_inputs(&inputs, ka, info, set);
+    qemu_private_signal_observe(QEMU_PRIVATE_SIGNAL_DELIVERY_PRE, env,
+                                frame_addr, layout.total_size, usig, 0,
+                                &inputs);
     frame = lock_user(VERIFY_WRITE, frame_addr, layout.total_size, 0);
     if (!frame) {
         goto give_sigsegv;
@@ -676,10 +766,16 @@ static void target_setup_frame(int usig, struct target_sigaction *ka,
     }
 
     unlock_user(frame, frame_addr, layout.total_size);
+    qemu_private_signal_observe(QEMU_PRIVATE_SIGNAL_DELIVERY_POST, env,
+                                frame_addr, layout.total_size, usig, 0,
+                                &inputs);
     return;
 
  give_sigsegv:
     unlock_user(frame, frame_addr, layout.total_size);
+    qemu_private_signal_observe(QEMU_PRIVATE_SIGNAL_DELIVERY_FAIL, env,
+                                frame_addr, layout.total_size, usig, 1,
+                                &inputs);
     force_sigsegv(usig);
 }
 
@@ -702,6 +798,8 @@ long do_rt_sigreturn(CPUARMState *env)
     abi_ulong frame_addr = env->xregs[31];
 
     trace_user_do_rt_sigreturn(env, frame_addr);
+    qemu_private_signal_observe(QEMU_PRIVATE_SIGNAL_RETURN_PRE, env,
+                                frame_addr, 0, 0, 0, NULL);
     if (frame_addr & 15) {
         goto badframe;
     }
@@ -717,10 +815,14 @@ long do_rt_sigreturn(CPUARMState *env)
     target_restore_altstack(&frame->uc.tuc_stack, env);
 
     unlock_user_struct(frame, frame_addr, 0);
+    qemu_private_signal_observe(QEMU_PRIVATE_SIGNAL_RETURN_POST, env,
+                                frame_addr, 0, 0, 0, NULL);
     return -QEMU_ESIGRETURN;
 
  badframe:
     unlock_user_struct(frame, frame_addr, 0);
+    qemu_private_signal_observe(QEMU_PRIVATE_SIGNAL_RETURN_FAIL, env,
+                                frame_addr, 0, 0, 1, NULL);
     force_sig(TARGET_SIGSEGV);
     return -QEMU_ESIGRETURN;
 }

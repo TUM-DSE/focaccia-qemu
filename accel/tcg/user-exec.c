@@ -33,12 +33,23 @@
 #include "qemu/atomic128.h"
 #include "qemu/qemu-plugin.h"
 #include "qemu/bswap.h"
+#include "qemu/log.h"
+#include "qemu/private-ram-observer.h"
+#include "qemu/private-ram-host-diagnostics.h"
 #include "qemu/int128.h"
 #include "trace.h"
 #include "tcg/tcg-ldst.h"
 #include "internal-common.h"
 #include "internal-target.h"
 #include "tb-internal.h"
+#ifdef TARGET_X86_64
+#include "target/i386/cpu.h"
+#endif
+#ifdef TARGET_AARCH64
+#include "target/arm/cpu.h"
+#include "target/arm/cpu-features.h"
+#include "target/arm/internals.h"
+#endif
 
 __thread uintptr_t helper_retaddr;
 
@@ -159,6 +170,26 @@ typedef struct PageFlagsNode {
 } PageFlagsNode;
 
 static IntervalTreeRoot pageflags_root;
+/* Protected by mmap_lock; provenance is never guessed from host VMAs. */
+static uint64_t mapping_observation_generation = 1;
+static bool mapping_observation_valid = true;
+
+static void mapping_observation_changed(void)
+{
+    assert_memory_lock();
+    if (mapping_observation_generation == UINT64_MAX) {
+        mapping_observation_valid = false;
+    } else {
+        mapping_observation_generation++;
+    }
+}
+
+void page_mapping_observation_invalidate(void)
+{
+    assert_memory_lock();
+    mapping_observation_valid = false;
+    mapping_observation_changed();
+}
 
 static PageFlagsNode *pageflags_find(target_ulong start, target_ulong last)
 {
@@ -175,6 +206,315 @@ static PageFlagsNode *pageflags_next(PageFlagsNode *p, target_ulong start,
 
     n = interval_tree_iter_next(&p->itree, start, last);
     return n ? container_of(n, PageFlagsNode, itree) : NULL;
+}
+
+bool page_mapping_observe_bti(target_ulong pc, QemuPluginBtiPage *result)
+{
+#if defined(TARGET_AARCH64) && defined(CONFIG_LINUX_USER)
+    ARMCPU *cpu;
+    CPUARMState *env;
+    int flags;
+    g_assert(result);
+    memset(result, 0, sizeof(*result));
+    mmap_lock();
+    if (!mapping_observation_valid || TARGET_PAGE_BITS != 12 ||
+        (pc & (TARGET_PAGE_SIZE - 1)) + 4 > TARGET_PAGE_SIZE) {
+        mmap_unlock();
+        return false;
+    }
+    flags = page_get_flags(pc);
+    cpu = ARM_CPU(current_cpu);
+    env = &cpu->env;
+    if (!(flags & PAGE_VALID) ||
+        (flags & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)) != PAGE_MAP_PRIVATE ||
+        !(flags & PAGE_EXEC) || (flags & (PAGE_WRITE | PAGE_WRITE_ORG))) {
+        mmap_unlock();
+        return false;
+    }
+    result->page_start = pc & TARGET_PAGE_MASK;
+    result->generation = mapping_observation_generation;
+    result->flags = (flags & PAGE_READ ? 1u : 0) |
+                    (flags & PAGE_WRITE_ORG ? 2u : 0) |
+                    (flags & PAGE_EXEC ? 4u : 0) |
+                    (flags & PAGE_VALID ? 8u : 0) |
+                    (flags & PAGE_MAP_PRIVATE ? 16u : 0) |
+                    (flags & PAGE_BTI ? 32u : 0);
+    result->features = (cpu_isar_feature(aa64_bti, cpu) ? 1u : 0) |
+                       ((env->cp15.sctlr_el[1] & SCTLR_BT0) ? 2u : 0) |
+                       ((env->aarch64 && arm_current_el(env) == 0) ? 4u : 0);
+    mmap_unlock();
+    return true;
+#else
+    (void)pc;
+    (void)result;
+    return false;
+#endif
+}
+
+bool qemu_plugin_observe_bti_page(uint64_t pc, QemuPluginBtiPage *result)
+{
+    if (!result || (target_ulong)pc != pc) {
+        return false;
+    }
+    return page_mapping_observe_bti((target_ulong)pc, result);
+}
+
+bool page_mapping_observation_uniform(target_ulong start, target_ulong len)
+{
+    const int mask = PAGE_VALID | PAGE_READ | PAGE_WRITE_ORG | PAGE_EXEC |
+                     PAGE_MAP_PRIVATE | PAGE_MAP_SHARED;
+    target_ulong cursor = start, last = start + len - 1;
+    int first = -1;
+    assert_memory_lock();
+    if (len == 0 || last < start) return false;
+    for (;;) {
+        PageFlagsNode *p = pageflags_find(cursor, last);
+        if (p == NULL || p->itree.start > cursor || !(p->flags & PAGE_VALID)) return false;
+        int flags = p->flags & mask;
+        int owner = flags & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED);
+        if (owner != PAGE_MAP_PRIVATE && owner != PAGE_MAP_SHARED) return false;
+        if (first == -1) first = flags;
+        if (first != flags) return false;
+        if (p->itree.last >= last) return true;
+        cursor = p->itree.last + 1;
+    }
+}
+
+static bool private_ram_read_verified(int fd, pid_t owner, uint64_t address,
+                                      uint8_t *buffer, uint64_t size)
+{
+    assert_memory_lock();
+    while (size) {
+        uint64_t chunk = MIN(size, TARGET_PAGE_SIZE - (address & ~TARGET_PAGE_MASK));
+        if ((target_ulong)address != address || address > UINT64_MAX - (chunk - 1) ||
+            (target_ulong)(address + chunk - 1) != address + chunk - 1) {
+            errno = EOVERFLOW;
+            return false;
+        }
+        int flags = page_get_flags(address);
+        if (!(flags & PAGE_VALID) ||
+            (flags & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)) != PAGE_MAP_PRIVATE) {
+            errno = EACCES;
+            return false;
+        }
+        uintptr_t host = (uintptr_t)g2h_untagged(address);
+        uintptr_t last = (uintptr_t)g2h_untagged(address + chunk - 1);
+        if (host > UINTPTR_MAX - (chunk - 1) || last != host + chunk - 1) {
+            errno = EOVERFLOW;
+            return false;
+        }
+        if (!qemu_private_ram_pread_owned(fd, owner, host, buffer, chunk)) return false;
+        address += chunk;
+        buffer += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
+static bool private_ram_collect_locked(GArray *mappings, uint64_t max_bytes,
+                                       uint32_t max_mappings, uint64_t *total)
+{
+    IntervalTreeNode *n;
+    assert_memory_lock();
+    *total = 0;
+    g_array_set_size(mappings, 0);
+    if (!mapping_observation_valid || !max_bytes || max_bytes > 64 * 1024 * 1024 ||
+        !max_mappings || max_mappings > 4096 ||
+        g_array_get_element_size(mappings) != sizeof(qemu_plugin_guest_mapping)) return false;
+    for (n = interval_tree_iter_first(&pageflags_root, 0, -1); n != NULL;
+         n = interval_tree_iter_next(n, 0, -1)) {
+        PageFlagsNode *p = container_of(n, PageFlagsNode, itree);
+        if (!(p->flags & PAGE_VALID)) continue;
+        if ((p->flags & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)) != PAGE_MAP_PRIVATE ||
+            (p->flags & PAGE_EXEC_SERVICE) || n->last == UINT64_MAX) return false;
+        uint64_t size = (uint64_t)n->last - n->start + 1;
+        if (!size || size > max_bytes - *total) return false;
+        uintptr_t host = (uintptr_t)g2h_untagged(n->start);
+        uintptr_t last_host = (uintptr_t)g2h_untagged(n->last);
+        if (host > UINTPTR_MAX - (size - 1) || last_host != host + size - 1 ||
+            host > INT64_MAX || size - 1 > INT64_MAX - host) return false;
+        uint32_t flags = 8 | 16;
+        if (p->flags & PAGE_READ) flags |= 1;
+        if (p->flags & PAGE_WRITE_ORG) flags |= 2;
+        if (p->flags & PAGE_EXEC) flags |= 4;
+        qemu_plugin_guest_mapping *previous = mappings->len ?
+            &g_array_index(mappings, qemu_plugin_guest_mapping, mappings->len - 1) : NULL;
+        if (previous && previous->start + previous->size == n->start && previous->flags == flags &&
+            previous->host_start + previous->size == host) {
+            previous->size += size;
+        } else {
+            if (mappings->len >= max_mappings) return false;
+            qemu_plugin_guest_mapping item = { .start = n->start, .size = size,
+                .flags = flags, .data_offset = *total, .host_start = host };
+            g_array_append_val(mappings, item);
+        }
+        *total += size;
+    }
+    return mappings->len != 0 && *total != 0;
+}
+
+/* Unlike the existing RAM-only collectors, this atomic-specific view may
+ * classify the one explicit synthetic execution service. It remains wholly
+ * unbacked and cannot be used by either snapshot or external data readers. */
+static bool private_atomic_collect_locked(GArray *mappings, uint64_t max_bytes,
+                                          uint32_t max_mappings, uint64_t *total)
+{
+#if defined(TARGET_X86_64)
+    IntervalTreeNode *n;
+    assert_memory_lock();
+    *total = 0;
+    g_array_set_size(mappings, 0);
+    if (!mapping_observation_valid || !max_bytes || max_bytes > 64 * 1024 * 1024 ||
+        !max_mappings || max_mappings > 4096 ||
+        g_array_get_element_size(mappings) != sizeof(qemu_plugin_guest_mapping)) return false;
+    for (n = interval_tree_iter_first(&pageflags_root, 0, -1); n != NULL;
+         n = interval_tree_iter_next(n, 0, -1)) {
+        PageFlagsNode *p = container_of(n, PageFlagsNode, itree);
+        qemu_plugin_guest_mapping item = {0};
+        uint64_t size;
+        if (!(p->flags & PAGE_VALID)) continue;
+        if (n->last == UINT64_MAX) return false;
+        size = (uint64_t)n->last - n->start + 1;
+        if (!size) return false;
+        if (p->flags & PAGE_EXEC_SERVICE) {
+            if (mappings->len >= max_mappings) return false;
+            if (p->flags != (PAGE_EXEC | PAGE_VALID | PAGE_EXEC_SERVICE) ||
+                n->start != TARGET_VSYSCALL_PAGE || size != TARGET_PAGE_SIZE) return false;
+            item = (qemu_plugin_guest_mapping) { .start = n->start, .size = size,
+                .flags = 4 | 8 | 64, .reserved = 1, .data_offset = UINT64_MAX,
+                .host_start = 0 };
+        } else {
+            uintptr_t host, last_host;
+            uint32_t flags = 8 | 16;
+            if ((p->flags & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)) != PAGE_MAP_PRIVATE ||
+                size > max_bytes - *total) return false;
+            host = (uintptr_t)g2h_untagged(n->start);
+            last_host = (uintptr_t)g2h_untagged(n->last);
+            if (host > UINTPTR_MAX - (size - 1) || last_host != host + size - 1 ||
+                host > INT64_MAX || size - 1 > INT64_MAX - host) return false;
+            if (p->flags & PAGE_READ) flags |= 1;
+            if (p->flags & PAGE_WRITE_ORG) flags |= 2;
+            if (p->flags & PAGE_EXEC) flags |= 4;
+            qemu_plugin_guest_mapping *previous = mappings->len ?
+                &g_array_index(mappings, qemu_plugin_guest_mapping, mappings->len - 1) : NULL;
+            if (previous && previous->reserved == 0 &&
+                previous->start + previous->size == n->start && previous->flags == flags &&
+                previous->host_start + previous->size == host &&
+                previous->data_offset + previous->size == *total) {
+                previous->size += size;
+            } else {
+                if (mappings->len >= max_mappings) return false;
+                item = (qemu_plugin_guest_mapping) { .start = n->start, .size = size,
+                    .flags = flags, .data_offset = *total, .host_start = host };
+                g_array_append_val(mappings, item);
+            }
+            *total += size;
+        }
+        if (item.reserved == 1) {
+            g_array_append_val(mappings, item);
+        }
+    }
+    return mappings->len != 0 && *total != 0;
+#else
+    (void)mappings; (void)max_bytes; (void)max_mappings;
+    *total = 0;
+    return false;
+#endif
+}
+
+bool qemu_plugin_private_atomic_inventory(GArray *mappings, uint64_t max_bytes,
+                                          uint32_t max_mappings, uint64_t *generation)
+{
+    uint64_t total;
+    bool captured;
+    g_assert(current_cpu && mappings && generation);
+    *generation = 0;
+    mmap_lock();
+    captured = private_atomic_collect_locked(mappings, max_bytes, max_mappings, &total);
+    if (captured) *generation = mapping_observation_generation;
+    else g_array_set_size(mappings, 0);
+    mmap_unlock();
+    return captured;
+}
+
+bool qemu_plugin_private_ram_inventory(GArray *mappings, uint64_t max_bytes,
+                                      uint32_t max_mappings, uint64_t *generation)
+{
+    uint64_t total;
+    bool captured;
+    g_assert(current_cpu && mappings && generation);
+    *generation = 0;
+    mmap_lock();
+    captured = private_ram_collect_locked(mappings, max_bytes, max_mappings, &total);
+    if (captured) *generation = mapping_observation_generation;
+    else g_array_set_size(mappings, 0);
+    mmap_unlock();
+    return captured;
+}
+
+bool qemu_plugin_private_ram_snapshot(GArray *mappings, GByteArray *memory,
+                                     uint64_t max_bytes, uint32_t max_mappings,
+                                     uint64_t *generation)
+{
+    bool success = false;
+    uint64_t total = 0, captured_generation = 0;
+    pid_t owner = getpid();
+    int reader_fd = -1;
+    g_assert(current_cpu);
+    g_assert(mappings && memory && generation);
+    g_array_set_size(mappings, 0);
+    g_byte_array_set_size(memory, 0);
+    *generation = 0;
+    if (max_bytes == 0 || max_bytes > 64 * 1024 * 1024 ||
+        max_mappings == 0 || max_mappings > 4096 ||
+        g_array_get_element_size(mappings) != sizeof(qemu_plugin_guest_mapping)) return false;
+    mmap_lock();
+    if (!private_ram_collect_locked(mappings, max_bytes, max_mappings, &total)) goto out;
+    captured_generation = mapping_observation_generation;
+    reader_fd = qemu_private_ram_open_owned(owner);
+    if (reader_fd < 0) {
+        qemu_log_mask(CPU_LOG_PAGE, "private RAM unavailable: owned observer fd errno=%d (%s)\n", errno, strerror(errno));
+        goto out;
+    }
+    g_byte_array_set_size(memory, total);
+    for (guint i = 0; i < mappings->len; i++) {
+        qemu_plugin_guest_mapping *item = &g_array_index(mappings, qemu_plugin_guest_mapping, i);
+        /* Linux owned-process observer reads never alter guest/host protections.
+         * Revalidate each page and g2h translation, even for PROT_NONE ranges. */
+        if (!private_ram_read_verified(reader_fd, owner, item->start,
+                                       memory->data + item->data_offset, item->size)) {
+            qemu_log_mask(CPU_LOG_PAGE, "private RAM unavailable: observer read start=%" PRIx64 " size=%" PRIu64 " flags=%x errno=%d (%s)\n",
+                          item->start, item->size, item->flags, errno, strerror(errno));
+            if (qemu_loglevel_mask(CPU_LOG_PAGE)) {
+                FILE *diagnostic = qemu_log_trylock();
+                if (diagnostic) {
+                    uintptr_t host = (uintptr_t)g2h_untagged(item->start);
+                    fprintf(diagnostic, "HOST_DIAGNOSTIC_ONLY guest=%" PRIx64 " host=%" PRIxPTR " generation=%" PRIu64 "\n",
+                            item->start, host, captured_generation);
+                    qemu_private_ram_diagnose_host(owner, host, item->size, diagnostic);
+                    qemu_log_unlock(diagnostic);
+                }
+            }
+            goto out;
+        }
+    }
+    if (!mapping_observation_valid || owner != getpid() ||
+        captured_generation != mapping_observation_generation ||
+        !qemu_private_ram_fd_is_owned(reader_fd, owner)) goto out;
+    *generation = captured_generation;
+    success = true;
+out:
+    if (reader_fd >= 0) {
+        int saved = errno;
+        close(reader_fd);
+        errno = saved;
+    }
+    if (!success) {
+        g_array_set_size(mappings, 0);
+        g_byte_array_set_size(memory, 0);
+    }
+    mmap_unlock();
+    return success;
 }
 
 int walk_memory_regions(void *priv, walk_memory_regions_fn fn)
@@ -394,7 +734,8 @@ static void pageflags_create_merge(target_ulong start, target_ulong last,
 #ifndef PAGE_TARGET_STICKY
 #define PAGE_TARGET_STICKY  0
 #endif
-#define PAGE_STICKY  (PAGE_ANON | PAGE_PASSTHROUGH | PAGE_TARGET_STICKY)
+#define PAGE_STICKY  (PAGE_ANON | PAGE_PASSTHROUGH | PAGE_TARGET_STICKY | \
+                     PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)
 
 /* A subroutine of page_set_flags: add flags to [start,last]. */
 static bool pageflags_set_clear(target_ulong start, target_ulong last,
@@ -549,6 +890,7 @@ void page_set_flags(target_ulong start, target_ulong last, int flags)
     /* Only set PAGE_ANON with new mappings. */
     assert(!(flags & PAGE_ANON) || (flags & PAGE_RESET));
     assert_memory_lock();
+    mapping_observation_changed();
 
     start &= TARGET_PAGE_MASK;
     last |= ~TARGET_PAGE_MASK;
