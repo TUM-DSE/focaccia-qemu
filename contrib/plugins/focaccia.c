@@ -598,8 +598,15 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
     }
     if (strcmp(target_name, "x86_64") == 0) {
 #ifdef __linux__
+        /* Complete private guest RAM (command 11) needs only the paused
+         * online boundary and target mmap provenance, as on AArch64; it does
+         * not depend on the atomic launch assumptions. The external inventory
+         * also certifies address-space generations for reusable snapshot
+         * plans, and the atomic environment needs its no-host-tamper launch
+         * profile, so both stay bound to the atomic-* options. */
+        if (online_blocks) capabilities |= CAP_PRIVATE_RAM;
         if (online_blocks && atomic_model_present && atomic_profile_present && atomic_no_host_tamper) {
-            capabilities |= CAP_PRIVATE_RAM | CAP_EXTERNAL_PRIVATE_RAM | CAP_PRIVATE_ATOMIC_ENV;
+            capabilities |= CAP_EXTERNAL_PRIVATE_RAM | CAP_PRIVATE_ATOMIC_ENV;
         }
 #endif
         if (g_hash_table_lookup(registers, "rax") != NULL) capabilities |= CAP_INTEGER;

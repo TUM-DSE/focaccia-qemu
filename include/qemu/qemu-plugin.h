@@ -944,8 +944,13 @@ uint32_t qemu_plugin_memory_permissions_vaddr(uint64_t addr, size_t len);
  * provenance, overflow or budgets fail the entire capture, never truncate it.
  * Linux only: an O_RDONLY|O_CLOEXEC proc-memory FD is verified as this process,
  * then exact pread copies are bounded to revalidated private target pages and
- * checked g2h translations. No guest/host protection changes are performed;
- * protected guards retain their real guest permission bits in the inventory.
+ * checked g2h translations. Guest page flags are never changed; protected
+ * guards retain their real guest permission bits in the inventory. Linux
+ * refuses proc-memory reads of PROT_NONE host pages, so a host page whose
+ * every target page is guest-inaccessible is read under a temporary
+ * PROT_READ host grant that is restored to PROT_NONE before the next page
+ * (failure to restore aborts). The x86_64 vsyscall page is a synthetic,
+ * unbacked execution service, not RAM, and is omitted.
  * Caller must quiesce all guest threads (the Focaccia producer enforces one
  * vCPU) and use a paused user-mode CPU callback. No system-mode equivalent.
  * Returns false with empty outputs/generation zero on unavailable evidence.

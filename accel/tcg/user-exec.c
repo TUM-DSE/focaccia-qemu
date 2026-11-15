@@ -34,6 +34,7 @@
 #include "qemu/qemu-plugin.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/private-ram-observer.h"
 #include "qemu/private-ram-host-diagnostics.h"
 #include "qemu/int128.h"
@@ -280,6 +281,53 @@ bool page_mapping_observation_uniform(target_ulong start, target_ulong len)
     }
 }
 
+/*
+ * Linux refuses /proc/self/mem (FOLL_FORCE) reads of PROT_NONE host pages
+ * with EIO, so the inaccessible guard pages that every guest stack has
+ * (setup_arg_pages) made any complete capture unavailable. The guest can
+ * never read such a page, but its bytes are still part of complete private
+ * RAM. Read them through a bounded, exactly restored host grant: only while
+ * mmap_lock is held at a paused single-vCPU boundary, only for a host page
+ * whose every target page is valid, proven MAP_PRIVATE and guest-inaccessible
+ * (so its host protection is PROT_NONE and it holds no translated code), and
+ * the PROT_NONE restoration is mandatory: linux-user relies on the host fault
+ * to deliver the guest fault, so failing to restore it aborts QEMU rather than
+ * leave a guest-visible change. Guest page flags are never modified.
+ */
+static bool private_ram_read_inaccessible(int fd, pid_t owner, uint64_t address,
+                                          uintptr_t host, uint8_t *buffer, uint64_t size)
+{
+    uintptr_t host_page_size = qemu_real_host_page_size();
+    uintptr_t host_start = host & -host_page_size;
+    uint64_t guest_start = address - (host - host_start);
+    bool read;
+    int saved;
+    assert_memory_lock();
+    if (guest_start > address || host_page_size < TARGET_PAGE_SIZE) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    for (uint64_t page = guest_start; page < guest_start + host_page_size;
+         page += TARGET_PAGE_SIZE) {
+        int flags = page_get_flags(page);
+        if (!(flags & PAGE_VALID) ||
+            (flags & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)) != PAGE_MAP_PRIVATE ||
+            (flags & (PAGE_READ | PAGE_WRITE | PAGE_WRITE_ORG | PAGE_EXEC))) {
+            errno = EACCES;
+            return false;
+        }
+    }
+    if (mprotect((void *)host_start, host_page_size, PROT_READ)) return false;
+    read = qemu_private_ram_pread_owned(fd, owner, host, buffer, size);
+    saved = errno;
+    if (mprotect((void *)host_start, host_page_size, PROT_NONE)) {
+        error_report("focaccia private RAM: cannot restore PROT_NONE guest page");
+        abort();
+    }
+    errno = saved;
+    return read;
+}
+
 static bool private_ram_read_verified(int fd, pid_t owner, uint64_t address,
                                       uint8_t *buffer, uint64_t size)
 {
@@ -303,12 +351,37 @@ static bool private_ram_read_verified(int fd, pid_t owner, uint64_t address,
             errno = EOVERFLOW;
             return false;
         }
-        if (!qemu_private_ram_pread_owned(fd, owner, host, buffer, chunk)) return false;
+        if (!qemu_private_ram_pread_owned(fd, owner, host, buffer, chunk)) {
+            if (errno != EIO || (flags & (PAGE_READ | PAGE_WRITE | PAGE_WRITE_ORG | PAGE_EXEC)) ||
+                !private_ram_read_inaccessible(fd, owner, address, host, buffer, chunk)) {
+                return false;
+            }
+        }
         address += chunk;
         buffer += chunk;
         size -= chunk;
     }
     return true;
+}
+
+/* The x86_64 vsyscall page (elfload.c init_guest_commpage) is QEMU's one
+ * synthetic execution service: guest-executable only, never readable or
+ * writable by the guest, with no target mmap provenance and no host backing.
+ * It is not guest RAM, so complete private-RAM evidence omits exactly that
+ * node (the same classification as private_atomic_collect_locked). Any other
+ * service-flagged node, or this one with different flags/extent, still makes
+ * the whole capture unavailable. */
+static bool private_ram_service_page(const PageFlagsNode *p, const IntervalTreeNode *n)
+{
+#if defined(TARGET_X86_64)
+    return (p->flags & PAGE_EXEC_SERVICE) &&
+           p->flags == (PAGE_EXEC | PAGE_VALID | PAGE_EXEC_SERVICE) &&
+           n->start == TARGET_VSYSCALL_PAGE &&
+           (uint64_t)n->last - n->start + 1 == TARGET_PAGE_SIZE;
+#else
+    (void)p; (void)n;
+    return false;
+#endif
 }
 
 static bool private_ram_collect_locked(GArray *mappings, uint64_t max_bytes,
@@ -325,6 +398,7 @@ static bool private_ram_collect_locked(GArray *mappings, uint64_t max_bytes,
          n = interval_tree_iter_next(n, 0, -1)) {
         PageFlagsNode *p = container_of(n, PageFlagsNode, itree);
         if (!(p->flags & PAGE_VALID)) continue;
+        if (private_ram_service_page(p, n)) continue;
         if ((p->flags & (PAGE_MAP_PRIVATE | PAGE_MAP_SHARED)) != PAGE_MAP_PRIVATE ||
             (p->flags & PAGE_EXEC_SERVICE) || n->last == UINT64_MAX) return false;
         uint64_t size = (uint64_t)n->last - n->start + 1;
@@ -479,8 +553,9 @@ bool qemu_plugin_private_ram_snapshot(GArray *mappings, GByteArray *memory,
     g_byte_array_set_size(memory, total);
     for (guint i = 0; i < mappings->len; i++) {
         qemu_plugin_guest_mapping *item = &g_array_index(mappings, qemu_plugin_guest_mapping, i);
-        /* Linux owned-process observer reads never alter guest/host protections.
-         * Revalidate each page and g2h translation, even for PROT_NONE ranges. */
+        /* Owned-process observer reads never alter guest page flags; only a
+         * wholly guest-inaccessible host page gets an exactly restored read
+         * grant. Revalidate each page and g2h translation, even for PROT_NONE. */
         if (!private_ram_read_verified(reader_fd, owner, item->start,
                                        memory->data + item->data_offset, item->size)) {
             qemu_log_mask(CPU_LOG_PAGE, "private RAM unavailable: observer read start=%" PRIx64 " size=%" PRIu64 " flags=%x errno=%d (%s)\n",
