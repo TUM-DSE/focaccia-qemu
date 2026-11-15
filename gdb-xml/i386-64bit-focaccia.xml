@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<!-- Read-only full-width RFLAGS for linux-user observers. The core
+     description only has the 32-bit eflags, so bits 63:32 are otherwise
+     unobservable. -->
+<!DOCTYPE feature SYSTEM "gdb-target.dtd">
+<feature name="org.focaccia.i386.rflags64">
+  <reg name="rflags64" bitsize="64" type="int64"/>
+</feature>

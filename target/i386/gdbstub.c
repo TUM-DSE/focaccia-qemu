@@ -451,6 +451,32 @@ static int x86_cpu_gdb_write_linux_register(CPUState *cs, uint8_t *mem_buf,
     return 0;
 }
 
+#ifdef TARGET_X86_64
+/*
+ * Read-only full-width RFLAGS: the low half exactly as the core eflags
+ * register reads it (live lazy flags inside cpu_exec, the stored value
+ * otherwise), bits 63:32 from the stored register.
+ */
+static int x86_cpu_gdb_read_rflags64(CPUState *cs, GByteArray *mem_buf, int n)
+{
+    X86CPU *cpu = X86_CPU(cs);
+    CPUX86State *env = &cpu->env;
+    uint32_t low = cpu->tcg_flags_live && qatomic_read(&cs->running)
+                   ? cpu_compute_eflags(env) : env->eflags;
+
+    if (n == 0) {
+        return gdb_get_reg64(mem_buf,
+                             low | (env->eflags & ~(target_ulong)UINT32_MAX));
+    }
+    return 0;
+}
+
+static int x86_cpu_gdb_write_rflags64(CPUState *cs, uint8_t *mem_buf, int n)
+{
+    return 0;
+}
+#endif
+
 #endif
 
 void x86_cpu_gdb_init(CPUState *cs)
@@ -464,5 +490,11 @@ void x86_cpu_gdb_init(CPUState *cs)
                              gdb_find_static_feature("i386-32bit-linux.xml"),
 #endif
                              0);
+#ifdef TARGET_X86_64
+    gdb_register_coprocessor(cs, x86_cpu_gdb_read_rflags64,
+                             x86_cpu_gdb_write_rflags64,
+                             gdb_find_static_feature("i386-64bit-focaccia.xml"),
+                             0);
+#endif
 #endif
 }
