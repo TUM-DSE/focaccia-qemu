@@ -112,6 +112,46 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define TARGET_LITTLE_ENDIAN 1u
 #define TARGET_BIG_ENDIAN 2u
 
+/* RV64GC linux-user observation. Capability bits 20 and 21 are already used
+ * by the DC ZVA footprint and live set_tid replay observers layered on this
+ * plugin. CAP_RISCV_FP covers f0..f31 and the fflags/frm/fcsr CSRs. ECALL
+ * boundaries reuse the shared syscall producers but carry their own event
+ * kinds, so a peer never mistakes them for AArch64 SVC events. */
+#define CAP_RISCV_FP (1ull << 22)
+#define CAP_RISCV_ECALL (1ull << 23)
+#define EVENT_RISCV_ECALL_ENTRY 7u
+#define EVENT_RISCV_ECALL_SUCCESSOR 8u
+#define RISCV_ECALL_OPCODE 0x00000073u
+#define ELF_MACHINE_AARCH64 183u
+#define ELF_MACHINE_RISCV 243u
+
+static bool target_riscv64;
+static const char *syscall_number_register = "x8";
+static const char *syscall_result_register = "x0";
+
+/* Integer and FP register names exactly as QEMU's riscv gdb XML exposes
+ * them: x1..x31 and f0..f31 in ABI spelling. */
+static const char *const riscv_integer_registers[31] = {
+    "ra", "sp", "gp", "tp", "t0", "t1", "t2", "fp", "s1", "a0", "a1",
+    "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6",
+    "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+};
+static const char *const riscv_fp_registers[32] = {
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1",
+    "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3",
+    "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11", "ft8", "ft9",
+    "ft10", "ft11",
+};
+
+/* RV64GC instruction length from its lowest byte: 16-bit RVC when the two
+ * low bits are not 11, otherwise 32-bit. Longer encodings are not RV64GC. */
+static unsigned int riscv_instruction_length(uint8_t low)
+{
+    if ((low & 3u) != 3u) return 2;
+    if ((low & 0x1cu) != 0x1cu) return 4;
+    return 0;
+}
+
 static const uint8_t protocol_magic[8] = {
     'F', 'O', 'C', 'P', 'L', 'U', 'G', 0,
 };
@@ -382,6 +422,12 @@ static bool select_target(const qemu_info_t *info)
     } else if (strcmp(target_name, "x86_64") == 0) {
         pc_register = "rip";
         target_endianness = TARGET_LITTLE_ENDIAN;
+    } else if (strcmp(target_name, "riscv64") == 0) {
+        pc_register = "pc";
+        target_endianness = TARGET_LITTLE_ENDIAN;
+        target_riscv64 = true;
+        syscall_number_register = "a7";
+        syscall_result_register = "a0";
     } else {
         return false;
     }
@@ -613,6 +659,33 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
         if (g_hash_table_lookup(registers, "eflags") != NULL) capabilities |= CAP_STATUS;
         if (g_hash_table_lookup(registers, "xmm0") != NULL) capabilities |= CAP_VECTOR;
         if (g_hash_table_lookup(registers, "fs_base") != NULL) capabilities |= CAP_TLS;
+    } else if (target_riscv64) {
+        /* The vDSO pin, private RAM and the external inventory rely only on
+         * the paused online boundary, the initial auxv and target mmap
+         * provenance, which riscv64 linux-user shares with AArch64. QEMU's
+         * riscv64 vDSO is built for rv64g, so its code is 4-byte aligned
+         * 32-bit instructions only. The logical-signal, BTI, DMB and async
+         * signal producers are AArch64 specific and stay off. The thread
+         * pointer is the integer register tp, so there is no CAP_TLS. */
+        if (online_blocks) {
+            capabilities |= CAP_PINNED_VDSO;
+#ifdef __linux__
+            capabilities |= CAP_PRIVATE_RAM | CAP_EXTERNAL_PRIVATE_RAM;
+#endif
+        }
+        bool integer = true, fp = true;
+        for (size_t i = 0; i < G_N_ELEMENTS(riscv_integer_registers); i++) {
+            integer &= g_hash_table_lookup(registers, riscv_integer_registers[i]) != NULL;
+        }
+        for (size_t i = 0; i < G_N_ELEMENTS(riscv_fp_registers); i++) {
+            fp &= g_hash_table_lookup(registers, riscv_fp_registers[i]) != NULL;
+        }
+        bool status = g_hash_table_lookup(registers, "fflags") != NULL &&
+            g_hash_table_lookup(registers, "frm") != NULL &&
+            g_hash_table_lookup(registers, "fcsr") != NULL;
+        if (integer) capabilities |= CAP_INTEGER | CAP_RISCV_ECALL;
+        if (status) capabilities |= CAP_STATUS;
+        if (fp && status) capabilities |= CAP_RISCV_FP;
     } else {
         if (g_hash_table_lookup(registers, "x0") != NULL &&
             g_hash_table_lookup(registers, "x8") != NULL) {
@@ -825,7 +898,8 @@ static void pin_initial_vdso(const uint8_t *command)
     uint16_t phsize = elf[54] | ((uint16_t)elf[55] << 8);
     uint16_t phnum = elf[56] | ((uint16_t)elf[57] << 8);
     uint64_t phoff = get_u64_le(elf + 32);
-    if (memcmp(elf, "\177ELF\002\001\001", 7) || type != 3 || machine != 183 ||
+    uint16_t expected_machine = target_riscv64 ? ELF_MACHINE_RISCV : ELF_MACHINE_AARCH64;
+    if (memcmp(elf, "\177ELF\002\001\001", 7) || type != 3 || machine != expected_machine ||
         get_u32_le(elf + 20) != 1 || ehsize != 64 || phsize != 56 ||
         phnum == 0 || phnum > MAX_VDSO_PHDRS || phoff < 64 ||
         phoff > size - (uint64_t)phnum * 56) {
@@ -1542,11 +1616,21 @@ static void command_loop(unsigned int cpu_index)
     }
 }
 
+/* The syscall boundary producers are shared by all targets. On riscv64 they
+ * report ECALL entry and successor events. */
+static uint8_t target_event_kind(uint8_t kind)
+{
+    if (target_riscv64 && kind == EVENT_AARCH64_SVC_ENTRY) return EVENT_RISCV_ECALL_ENTRY;
+    if (target_riscv64 && kind == EVENT_AARCH64_SVC_SUCCESSOR) return EVENT_RISCV_ECALL_SUCCESSOR;
+    return kind;
+}
+
 static void send_event_wait(unsigned int cpu_index, uint8_t kind, uint64_t pc,
                        uint64_t address, uint64_t size, uint64_t auxiliary,
                        const uint8_t value[16], bool automatic)
 {
     uint8_t event[EVENT_SIZE] = {0};
+    kind = target_event_kind(kind);
     footprint_drained = false;
     event[0] = kind;
     event[1] = automatic;
@@ -1627,7 +1711,7 @@ static void flush_pending_events(unsigned int cpu_index, uint64_t successor_pc)
     g_array_set_size(pending_stores, 0);
 
     if (pending_svc) {
-        uint64_t result = read_register_u64("x0");
+        uint64_t result = read_register_u64(syscall_result_register);
         send_event(cpu_index, EVENT_AARCH64_SVC_SUCCESSOR, successor_pc,
                    pending_svc_pc, 0, result, NULL);
         pending_svc = false;
@@ -1693,8 +1777,8 @@ static void execute_instruction(unsigned int cpu_index, void *userdata)
         g_array_set_size(pending_stores, 0);
     }
     if (metadata->svc) {
-        uint64_t number = read_register_u64("x8");
-        uint64_t argument = read_register_u64("x0");
+        uint64_t number = read_register_u64(syscall_number_register);
+        uint64_t argument = read_register_u64(syscall_result_register);
         send_event(cpu_index, EVENT_AARCH64_SVC_ENTRY, metadata->address,
                    argument, 0, number, NULL);
         pending_svc = true;
@@ -1853,6 +1937,14 @@ static void instrument_translation_block(
                 instruction_size > UINT64_MAX - address || (!root && !vdso) || (index != 0 && block->pinned_vdso != vdso)) {
                 protocol_failure("online block is not contiguous in a declared executable image");
             }
+            if (target_riscv64) {
+                uint8_t low = 0;
+                if (qemu_plugin_insn_data(qemu_plugin_tb_get_insn(translation_block, index),
+                                          &low, sizeof(low)) != sizeof(low) ||
+                    instruction_size != riscv_instruction_length(low)) {
+                    protocol_failure("RISC-V instruction extent differs from its encoding length");
+                }
+            }
             if (vdso) {
                 uint8_t code[4];
                 if (instruction_size != 4 || address % 4 ||
@@ -1917,6 +2009,16 @@ static void instrument_translation_block(
             if (qemu_plugin_insn_data(instruction, &opcode, sizeof(opcode)) == sizeof(opcode)) {
                 svc = (opcode & 0xffe0001fu) == 0xd4000001u;
             }
+        } else if (target_riscv64) {
+            uint8_t bytes[4];
+            size_t size = qemu_plugin_insn_size(instruction);
+            if (size == 0 || qemu_plugin_insn_data(instruction, bytes, 1) != 1 ||
+                size != riscv_instruction_length(bytes[0])) {
+                protocol_failure("RISC-V instruction extent differs from its encoding length");
+            }
+            svc = size == 4 &&
+                qemu_plugin_insn_data(instruction, bytes, sizeof(bytes)) == sizeof(bytes) &&
+                get_u32_le(bytes) == RISCV_ECALL_OPCODE;
         }
         InstructionMetadata *metadata = g_new0(InstructionMetadata, 1);
         metadata->address = address;
