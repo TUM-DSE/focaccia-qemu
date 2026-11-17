@@ -260,6 +260,20 @@ static void arm_gen_one_feature_sysreg(GDBFeatureBuilder *builder,
     dyn_feature->data.cpregs.keys[n] = ri_key;
 }
 
+/*
+ * DCZID_EL0 is ARM_CP_NO_RAW because it has no migratable backing field,
+ * but its readfn only derives the configured DC ZVA block size and the DZP
+ * bit from the current control state: reading it has no side effects and
+ * needs no access check at EL0. Expose it read-only (writes are already
+ * refused by arm_gdb_set_sysreg) so observers such as TCG plugins can bind
+ * the cache-zeroing block size a guest program sees.
+ */
+static bool arm_gdb_sysreg_readable_no_raw(const ARMCPRegInfo *ri)
+{
+    return ri->state == ARM_CP_STATE_AA64 && !(ri->type & ARM_CP_NO_GDB) &&
+           ri->readfn != NULL && strcmp(ri->name, "DCZID_EL0") == 0;
+}
+
 static void arm_register_sysreg_for_feature(gpointer key, gpointer value,
                                             gpointer p)
 {
@@ -270,7 +284,8 @@ static void arm_register_sysreg_for_feature(gpointer key, gpointer value,
     CPUARMState *env = &cpu->env;
     DynamicGDBFeatureInfo *dyn_feature = &cpu->dyn_sysreg_feature;
 
-    if (!(ri->type & (ARM_CP_NO_RAW | ARM_CP_NO_GDB))) {
+    if (!(ri->type & (ARM_CP_NO_RAW | ARM_CP_NO_GDB)) ||
+        arm_gdb_sysreg_readable_no_raw(ri)) {
         if (arm_feature(env, ARM_FEATURE_AARCH64)) {
             if (ri->state == ARM_CP_STATE_AA64) {
                 arm_gen_one_feature_sysreg(&param->builder, dyn_feature,
