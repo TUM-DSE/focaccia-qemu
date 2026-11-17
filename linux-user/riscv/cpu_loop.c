@@ -25,6 +25,7 @@
 #include "signal-common.h"
 #include "elf.h"
 #include "semihosting/common-semi.h"
+#include "user/syscall-trace.h"
 
 void cpu_loop(CPURISCVState *env)
 {
@@ -49,8 +50,15 @@ void cpu_loop(CPURISCVState *env)
             env->pc += 4;
             if (env->gpr[xA7] == TARGET_NR_riscv_flush_icache) {
                 /* riscv_flush_icache_syscall is a no-op in QEMU as
-                   self-modifying code is automatically detected */
+                   self-modifying code is automatically detected.
+                   It still is an ECALL syscall, so report it to the
+                   syscall observers exactly as do_syscall() would. */
+                record_syscall_start(cs, TARGET_NR_riscv_flush_icache,
+                                     env->gpr[xA0], env->gpr[xA1],
+                                     env->gpr[xA2], env->gpr[xA3],
+                                     env->gpr[xA4], env->gpr[xA5], 0, 0);
                 ret = 0;
+                record_syscall_return(cs, TARGET_NR_riscv_flush_icache, ret);
             } else {
                 ret = do_syscall(env,
                                  env->gpr[(env->elf_flags & EF_RISCV_RVE)
