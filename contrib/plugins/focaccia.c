@@ -61,7 +61,21 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define MAX_PRIVATE_RAM_MAPPINGS 4096u
 #define MAX_PINNED_VDSO_BYTES 65536u
 #define MAX_VDSO_PHDRS 32u
-#define MAX_STORE_FOOTPRINT 65536u
+/*
+ * Hard bound on store records between two consecutive paused events, i.e.
+ * during one translation-block execution.  It must cover the largest
+ * legitimate footprint of one TB pass: on x86, do_gen_rep() iterates a REP
+ * string instruction inside one TB execution while the low 16 bits of the
+ * decremented count are non-zero (REP_MAX = 65535) and then runs the
+ * separately translated last iteration, i.e. up to REP_MAX + 2 = 65537
+ * iterations; REP STOS/MOVS/INS store once per iteration.  The REP
+ * instruction ends its TB, but up to TCG_MAX_INSNS - 1 = 511 preceding
+ * instructions of the same TB add their stores (bounded generously by 4096
+ * records each, e.g. helper-based XSAVE/FXSAVE stores).  65537 + 511 * 4096
+ * = 2158593 < 2^22.  Exceeding the bound remains a fatal protocol failure;
+ * records are never truncated or coalesced.
+ */
+#define MAX_STORE_FOOTPRINT (1u << 22)
 #define REGISTER_NAME_SIZE 32u
 
 #define COMMAND_READ_REGISTER 1u
@@ -226,7 +240,9 @@ static bool coarse_cutpoints;
 static bool online_blocks;
 static bool online_store_footprint;
 typedef struct { uint64_t address, size; } StoreSpan;
-static StoreSpan store_footprint[MAX_STORE_FOOTPRINT];
+/* MAX_STORE_FOOTPRINT entries (64 MiB virtual), allocated once at install
+ * when the store footprint is enabled; only pages actually used are touched. */
+static StoreSpan *store_footprint;
 static uint32_t store_footprint_count;
 static uint64_t footprint_from_sequence, footprint_from_epoch;
 static bool footprint_drained;
@@ -491,6 +507,8 @@ static bool parse_options(int argc, char **argv)
         if (!online_blocks) return false;
         /* Every footprint must be drained while its terminating event is paused. */
         automatic_snapshots = false;
+        store_footprint = g_try_new(StoreSpan, MAX_STORE_FOOTPRINT);
+        if (!store_footprint) return false;
     }
     if (start_address > stop_address ||
         !identity_present[0] || !identity_present[1] ||
