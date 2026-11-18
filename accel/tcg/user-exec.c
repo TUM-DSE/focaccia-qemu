@@ -391,7 +391,7 @@ static bool private_ram_collect_locked(GArray *mappings, uint64_t max_bytes,
     assert_memory_lock();
     *total = 0;
     g_array_set_size(mappings, 0);
-    if (!mapping_observation_valid || !max_bytes || max_bytes > 64 * 1024 * 1024 ||
+    if (!mapping_observation_valid || !max_bytes || max_bytes > (UINT64_C(1) << 30) ||
         !max_mappings || max_mappings > 4096 ||
         g_array_get_element_size(mappings) != sizeof(qemu_plugin_guest_mapping)) return false;
     for (n = interval_tree_iter_first(&pageflags_root, 0, -1); n != NULL;

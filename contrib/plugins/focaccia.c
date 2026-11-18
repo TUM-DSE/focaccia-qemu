@@ -58,6 +58,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define CAP_EXTERNAL_PRIVATE_RAM (1ull << 11)
 #define CAP_PRIVATE_ATOMIC_ENV (1ull << 13)
 #define MAX_PRIVATE_RAM_BYTES (64u * 1024u * 1024u)
+#define MAX_PRIVATE_RAM_INVENTORY_BYTES (UINT64_C(1) << 30)
 #define MAX_PRIVATE_RAM_MAPPINGS 4096u
 #define MAX_PINNED_VDSO_BYTES 65536u
 #define MAX_VDSO_PHDRS 32u
@@ -919,7 +920,7 @@ static void send_private_inventory(const uint8_t *command)
     uint64_t budget = get_u64_le(command + 24);
     if (!online_blocks || !(capabilities & CAP_EXTERNAL_PRIVATE_RAM) ||
         sequence != event_sequence || epoch != event_epoch || !budget ||
-        budget > MAX_PRIVATE_RAM_BYTES || inventory_token == UINT64_MAX) {
+        budget > MAX_PRIVATE_RAM_INVENTORY_BYTES || inventory_token == UINT64_MAX) {
         protocol_failure("invalid external private inventory input boundary");
     }
     clear_private_inventory();
@@ -973,7 +974,7 @@ static void verify_private_inventory(const uint8_t *command)
     if (get_u64_le(payload) != item->generation || get_u32_le(payload + 12) ||
         memcmp(payload + 24, item->digest, 32) || phase > 1 || item->sealed ||
         (phase == 0 && (item->preflight || captured || memcmp(payload + 56, (uint8_t[32]){0}, 32))) ||
-        (phase == 1 && (!item->preflight || captured != item->total))) {
+        (phase == 1 && (!item->preflight || captured > item->total))) {
         protocol_failure("invalid external inventory certificate/phase");
     }
     g_autoptr(GArray) current = g_array_new(false, false, sizeof(qemu_plugin_guest_mapping));
@@ -987,7 +988,8 @@ static void verify_private_inventory(const uint8_t *command)
     if (phase == 0) item->preflight = true;
     else item->sealed = true;
     uint8_t response[64] = {0};
-    private_inventory_header(response, "FOCIVFY\0", RESPONSE_OK, item, phase == 0 ? 3 : 4);
+    private_inventory_header(response, "FOCIVFY\0", RESPONSE_OK, item,
+                             phase == 0 ? 3 : (captured == item->total ? 4 : 5));
     if (!write_full(socket_fd, response, sizeof(response)) ||
         !write_full(socket_fd, payload + 56, 32)) protocol_failure("inventory verification acknowledgement failed");
 }
