@@ -119,6 +119,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
  * kinds, so a peer never mistakes them for AArch64 SVC events. */
 #define CAP_RISCV_FP (1ull << 22)
 #define CAP_RISCV_ECALL (1ull << 23)
+/* Paired linux-user translator ends every LR/SC translation block. */
+#define CAP_RISCV_LRSC_TB_END (1ull << 24)
 #define EVENT_RISCV_ECALL_ENTRY 7u
 #define EVENT_RISCV_ECALL_SUCCESSOR 8u
 #define RISCV_ECALL_OPCODE 0x00000073u
@@ -683,7 +685,7 @@ static void initialize_vcpu(qemu_plugin_id_t id, unsigned int vcpu_index)
         bool status = g_hash_table_lookup(registers, "fflags") != NULL &&
             g_hash_table_lookup(registers, "frm") != NULL &&
             g_hash_table_lookup(registers, "fcsr") != NULL;
-        if (integer) capabilities |= CAP_INTEGER | CAP_RISCV_ECALL;
+        if (integer) capabilities |= CAP_INTEGER | CAP_RISCV_ECALL | CAP_RISCV_LRSC_TB_END;
         if (status) capabilities |= CAP_STATUS;
         if (fp && status) capabilities |= CAP_RISCV_FP;
     } else {

@@ -52,6 +52,10 @@ static bool gen_lr(DisasContext *ctx, arg_atomic *a, MemOp mop)
     tcg_gen_mov_tl(load_res, src1);
     gen_set_gpr(ctx, a->rd, load_val);
 
+#ifdef CONFIG_USER_ONLY
+    /* Observer boundary only: expose the completed LR before later code. */
+    ctx->base.is_jmp = DISAS_TOO_MANY;
+#endif
     return true;
 }
 
@@ -93,6 +97,10 @@ static bool gen_sc(DisasContext *ctx, arg_atomic *a, MemOp mop)
      */
     tcg_gen_movi_tl(load_res, -1);
 
+#ifdef CONFIG_USER_ONLY
+    /* Expose rd and the store footprint before either can be overwritten. */
+    ctx->base.is_jmp = DISAS_TOO_MANY;
+#endif
     return true;
 }
 
